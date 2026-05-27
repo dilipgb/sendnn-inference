@@ -800,11 +800,6 @@ class SpyreWorker(WorkerBase):
             req_state = self.model_runner.requests[req_id]  # type: ignore[attr-defined]
             req_state.append_output_token_ids(sampled_ids[i])
 
-    def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput:
-        from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
-
-        return EMPTY_MODEL_RUNNER_OUTPUT
-
     @SpyrePlatform.inference_mode()
     def sample_tokens(
         self,
