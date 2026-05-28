@@ -770,10 +770,27 @@ class SpyreWorker(WorkerBase):
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 
-    def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput:
-        from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
-
-        return EMPTY_MODEL_RUNNER_OUTPUT
+    def sample_tokens(
+        self,
+        scheduler_output: "SchedulerOutput",
+        grammar_output: "GrammarOutput",
+    ) -> ModelRunnerOutput:
+        """Complete sampling with grammar bitmask after async grammar building.
+        
+        This is called by the engine after grammar bitmasks have been built
+        asynchronously while the model was running.
+        """
+        if self.is_pooling:
+            # Pooling models don't use sampling
+            from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
+            return EMPTY_MODEL_RUNNER_OUTPUT
+        
+        # Delegate to the model runner (ChunkedPrefillModelRunner)
+        assert isinstance(self.model_runner, ChunkedPrefillModelRunner), (
+            "sample_tokens only supported for ChunkedPrefillModelRunner"
+        )
+        output = self.model_runner.sample_tokens(scheduler_output, grammar_output)
+        return output if self.is_driver_worker else None
 
     @SpyrePlatform.inference_mode()
     def execute_model(
