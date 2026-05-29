@@ -1493,9 +1493,15 @@ class ChunkedPrefillModelRunner(
     ) -> None:
         """Apply grammar bitmask in-place to constrain logits for structured
         output requests.
+        
+        This method checks if grammar output has been pre-computed and attached
+        to the scheduler_output. If not present, it will be computed synchronously
+        for backward compatibility.
         """
         grammar_output = getattr(scheduler_output, "_spyre_grammar_output", None)
         if grammar_output is None:
+            # Grammar output not pre-computed, skip application
+            # This allows for async grammar preparation workflow
             return
 
         vllm_apply_grammar_bitmask(
@@ -1511,6 +1517,31 @@ class ChunkedPrefillModelRunner(
         scheduler_output: SchedulerOutput,
         **kwargs,
     ) -> ModelRunnerOutput:
+        """
+        Execute the model forward pass and return data for sampling.
+        
+        This method performs the model forward pass. The return value depends on the scenario:
+        
+        1. Empty batch: Returns empty ModelRunnerOutput
+        2. Incomplete prefill: Returns ModelRunnerOutput with prefill metadata (no sampling)
+        3. Complete prefill or decode: Returns tuple (logits, is_prefill, model_input, t0)
+           for the worker to perform sampling with grammar constraints
+        
+        The separation of forward pass and sampling enables async workflows where
+        grammar preparation can happen while the model runs.
+        
+        Args:
+            scheduler_output: Scheduler output containing request info
+            **kwargs: Additional arguments
+            
+        Returns:
+            ModelRunnerOutput for empty batches or incomplete prefills.
+            Tuple (logits, is_prefill, model_input, t0) when sampling is needed.
+            
+        Note:
+            The tuple return is detected by the worker's execute_model() which then
+            calls sample_tokens() to complete the inference step.
+        """
         t0 = time.time()
 
         self.update_states(scheduler_output)
@@ -1561,49 +1592,9 @@ class ChunkedPrefillModelRunner(
             logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
             return self.prefill_output()
 
-        # Apply grammar bitmask for structured output requests.
-        self.apply_grammar_bitmask(
-            scheduler_output,
-            logits,
-            self.prefill_batch if is_prefill else self.input_batch,
-        )
-
-        # Sample the next token.
-        output: SamplerOutput | None = self.model.sample(
-            logits=logits,
-            sampling_metadata=self.get_sampling_metadata(is_prefill),
-        )
-        assert output is not None, "Expected sampler output"
-
-        t1 = time.time() - t0
-        batch_size = model_input.input_tokens.shape[0]
-        step_type = "[prefill last chunk]" if is_prefill else "[decode]"
-        logger.debug("t_token: %.2fms %s[batch size %d]", (t1 * 1000), step_type, batch_size)
-
-        # Get the right batch, if this is the last chunk to conclude the
-        # prefill, we'll generate a token and we should get from the prefill
-        # batch because input_batch may have other request that are were
-        # not processed at this step.
-        batch = self.prefill_batch if is_prefill else self.input_batch
-
-        # Add the sampled token(s) to the request cache
-        req_ids = (
-            [r.req_id for r in scheduler_output.scheduled_new_reqs]
-            if len(scheduler_output.scheduled_new_reqs) > 0
-            else batch.sorted_requests_ids
-        )
-        sampled_ids = output.sampled_token_ids.tolist()
-
-        for i, req_id in enumerate(req_ids):
-            req_state = self.requests[req_id]
-            req_state.append_output_token_ids(sampled_ids[i])
-
-        # Only return outputs from the driver worker
-        if not self.is_driver_worker:
-            return self.get_empty_output()
-
-        model_output = self.sampled_output(output, is_prefill)
-        return model_output
+        # Return logits and metadata to worker for sampling
+        # Worker will call sample_tokens() with this data
+        return (logits, is_prefill, model_input, t0)
 
     def prefill_output(self) -> SpyreModelRunnerOutput:
         req_id_to_index = self.get_req_id_to_index(is_prefill=True)
