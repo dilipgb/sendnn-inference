@@ -24,7 +24,7 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput, Sample
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.request import Request
 from vllm.v1.structured_output.utils import (
-    apply_grammar_bitmask as vllm_apply_grammar_bitmask,
+    apply_grammar_bitmask as vllm_apply_grammar_bitmask
 )
 
 import sendnn_inference.envs as envs_spyre
@@ -1504,6 +1504,9 @@ class ChunkedPrefillModelRunner(
         if grammar_output is None:
             return
 
+        # Simply call the upstream function - it handles everything correctly
+        # The issue was that we were trying to filter, but the upstream function
+        # expects the full batch and handles finished requests internally
         vllm_apply_grammar_bitmask(
             scheduler_output,
             grammar_output,
@@ -1643,8 +1646,7 @@ class ChunkedPrefillModelRunner(
         )
     def sample_tokens(
         self,
-        scheduler_output: "SchedulerOutput",
-        grammar_output: "GrammarOutput",
+        scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput:
         """Complete sampling with the grammar bitmask after async grammar building.
         
