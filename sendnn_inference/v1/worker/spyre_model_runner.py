@@ -1503,6 +1503,12 @@ class ChunkedPrefillModelRunner(
         grammar_output = getattr(scheduler_output, "_spyre_grammar_output", None)
         if grammar_output is None:
             return
+            
+        class _DenseBatchAdapter:
+            def __init__(self, dense_req_ids: list[str]):
+                self.req_ids = dense_req_ids
+
+    
 
         # Simply call the upstream function - it handles everything correctly
         # The issue was that we were trying to filter, but the upstream function
@@ -1510,7 +1516,7 @@ class ChunkedPrefillModelRunner(
         vllm_apply_grammar_bitmask(
             scheduler_output,
             grammar_output,
-            batch,  # type: ignore[arg-type]
+            _DenseBatchAdapter(batch.sorted_requests_ids),  # type: ignore[arg-type]
             logits,
         )
 
