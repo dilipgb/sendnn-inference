@@ -247,8 +247,7 @@ class SpyreCausalLM(nn.Module):
         self.is_multimodal = self.mm_model_utils is not None
 
         if envs_spyre.SENDNN_INFERENCE_DYNAMO_BACKEND in BACKEND_LIST:
-            if not model_config.quantization:
-                self._cast_params_for_spyre()
+            self._cast_params_for_spyre()
             options = {"sendnn.dynamic": True} if sendnn_dynamic else {}
 
             # Lazy import to avoid load torch_sendnn runtime before it is really
