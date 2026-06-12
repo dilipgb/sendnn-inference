@@ -1607,7 +1607,7 @@ class ChunkedPrefillModelRunner(
             scheduler_output_copy = scheduler_output
 
         self._pending_sampling_state = SamplingState(
-            logits=logits.clone(),  # Clone to prevent reuse bugs (expensive but necessary)
+            logits=logits,  # Store reference directly without cloning
             metadata=metadata,  # Deep copied to prevent mutation
             is_prefill=is_prefill,
             scheduler_output=scheduler_output_copy,  # Deep copied to prevent mutation/recycling
