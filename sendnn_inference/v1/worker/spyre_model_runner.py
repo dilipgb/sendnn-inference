@@ -1707,13 +1707,9 @@ class ChunkedPrefillModelRunner(
             logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
             return self.prefill_output()
 
-        # OPTIMIZATION: Only driver worker needs to defer sampling
-        # Non-driver workers can return immediately to avoid memory leak
-        # (storing cloned logits, metadata, scheduler_output on every worker)
-        if not self.is_driver_worker:
-            return self.get_empty_output()
-
-        # Always defer sampling - let the engine call it afterwards
+        # Always defer sampling - let the engine call sample_tokens afterwards
+        # All workers (including non-driver) need to defer so they can update
+        # their request states with sampled tokens via sample_tokens/perform_sampling
         self.defer_sampling(logits, is_prefill, scheduler_output)
         return None
 
