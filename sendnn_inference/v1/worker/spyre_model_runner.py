@@ -1480,18 +1480,11 @@ class ChunkedPrefillModelRunner(
         if scheduler_output.finished_req_ids:
             for req_id in scheduler_output.finished_req_ids:
                 self.input_batch.remove_request(req_id)
-                # Clean up request state to prevent memory leak
-                # Without this, SamplingRequestState (including cached_mm_embeddings,
-                # generators, block_ids) leaks for every completed request
                 self.requests.pop(req_id, None)
                 # TODO: Processing multiple removals at once can break alignment
                 # of logitprocs. Refactor so that we can batch removals to the
                 # `input_batch`
                 self.input_batch.refresh_metadata()
-
-            # If pending sampling exists and requests were finished/aborted,
-            # the pending state may now be invalid (batch mismatch, KeyError on req_id)
-            # Clear it to prevent crashes when sample_tokens() eventually arrives
             if self._pending_sampling_state is not None:
                 logger.warning(
                     "Requests finished/aborted while grammar sampling was pending. "
@@ -1567,47 +1560,12 @@ class ChunkedPrefillModelRunner(
         Stores the current sampling context for later completion.
         """
         # Protect against double defer (batch A overwriting batch B)
-        if self._pending_sampling_state is not None:
-            raise RuntimeError(
-                "Multiple deferred sampling batches are not supported. "
-                "defer_sampling() called twice without sample_tokens() in between. "
-                "This would leak the previous batch's state (logits, metadata, scheduler_output). "
-                "Engine must guarantee at most one pending grammar batch globally."
-            )
-
-        # Deep copy metadata to prevent mutation issues
-        # SamplingMetadata likely contains mutable tensors (selected_token_indices,
-        # generators, sampling_tensors, temperature arrays) that are updated by
-        # refresh_metadata() on every scheduler step. If we store by reference,
-        # when sample_tokens() executes, it will use metadata from a different
-        # batch, causing wrong sampling (wrong request, wrong temperature, wrong RNG).
-        try:
-            metadata = copy.deepcopy(self.get_sampling_metadata(is_prefill))
-        except Exception as e:
-            logger.error(
-                "Failed to deep copy SamplingMetadata. This may cause correctness issues "
-                "if metadata is mutated before sample_tokens() is called. Error: %s",
-                e,
-            )
-            # Fall back to reference (risky but allows execution to continue)
-            metadata = self.get_sampling_metadata(is_prefill)
-
-        # Deep copy scheduler_output to prevent mutation issues
-        # Many schedulers recycle objects for performance. If scheduler mutates
-        # this object later, stored_scheduler_output may no longer represent the
-        # batch that produced the logits. This can cause: wrong req_ids, wrong
-        # grammar mapping, wrong logprob routing.
-        try:
-            scheduler_output_copy = copy.deepcopy(scheduler_output)
-        except Exception as e:
-            logger.error(
-                "Failed to deep copy SchedulerOutput. This may cause correctness issues "
-                "if scheduler_output is mutated before sample_tokens() is called. Error: %s",
-                e,
-            )
-            # Fall back to reference (risky but allows execution to continue)
-            scheduler_output_copy = scheduler_output
-
+        assert self._pending_sampling_state is None, (
+            "Multiple deferred sampling batches are not supported. "
+            "Previous batch must be consumed via sample_tokens() before deferring another."
+        )
+        metadata = copy.deepcopy(self.get_sampling_metadata(is_prefill))
+        scheduler_output_copy = copy.deepcopy(scheduler_output)
         self._pending_sampling_state = SamplingState(
             logits=logits.clone(),  # Clone to prevent reuse bugs (expensive but necessary)
             metadata=metadata,  # Deep copied to prevent mutation
@@ -1624,40 +1582,8 @@ class ChunkedPrefillModelRunner(
         )
 
     def clear_pending_sampling(self) -> None:
-        """Clear any pending sampling state.
-
-        This should be called on error paths or when aborting deferred sampling
-        to prevent memory leaks.
-
-        IMPORTANT: This method must be called in the following scenarios:
-        - Request cancellation before sample_tokens() is called
-        - Grammar build failure
-        - Worker shutdown
-        - Any error path after defer_sampling() but before sample_tokens()
-
-        Failure to call this will leak:
-        - Cloned logits tensor (GPU memory, ~4MB per batch for 16×128k vocab)
-        - SamplingMetadata references
-        - SchedulerOutput references
-        """
-        if self._pending_sampling_state is not None:
-            logger.warning(
-                "Clearing pending sampling state without sample_tokens() being called. "
-                "This may indicate a request cancellation, grammar build failure, or shutdown. "
-                "Leaked state: logits (GPU memory), metadata, scheduler_output."
-            )
+        """Clear pending sampling state to prevent memory leaks."""
         self._pending_sampling_state = None
-
-    def apply_constraints(
-        self,
-        scheduler_output: "SchedulerOutput",
-        grammar_output: "GrammarOutput | None",
-        logits: torch.Tensor,
-        is_prefill: bool,
-    ) -> None:
-        """Apply grammar constraints to logits."""
-        batch = self.prefill_batch if is_prefill else self.input_batch
-        self.apply_grammar_bitmask(scheduler_output, grammar_output, logits, batch)
 
     def perform_sampling(
         self,
@@ -1665,6 +1591,7 @@ class ChunkedPrefillModelRunner(
         sampling_metadata: "SamplingMetadata",
         is_prefill: bool,
         scheduler_output: "SchedulerOutput",
+        grammar_output: "GrammarOutput | None",
         t0: float,
     ) -> ModelRunnerOutput | None:
         """Perform sampling and build output.
@@ -1674,11 +1601,17 @@ class ChunkedPrefillModelRunner(
             sampling_metadata: The sampling metadata to use.
             is_prefill: Whether this is a prefill step.
             scheduler_output: The scheduler output.
+            grammar_output: The grammar output with bitmasks to apply. If None, no grammar
+                is applied.
             t0: Start time for performance logging.
 
         Returns:
             The model runner output with sampled tokens, or None for non-driver workers.
         """
+        # Apply grammar constraints to logits
+        batch = self.prefill_batch if is_prefill else self.input_batch
+        self.apply_grammar_bitmask(scheduler_output, grammar_output, logits, batch)
+
         # Sample the next token
         output: SamplerOutput | None = self.model.sample(
             logits=logits,
@@ -1774,26 +1707,15 @@ class ChunkedPrefillModelRunner(
             logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
             return self.prefill_output()
 
-        # Check if grammar is pending
-        grammar_output = getattr(scheduler_output, "_spyre_grammar_output", None)
-        grammar_req_ids = getattr(scheduler_output, "grammar_req_ids", None)
-        if grammar_output is None and grammar_req_ids is not None:
-            # OPTIMIZATION: Only driver worker needs to defer sampling
-            # Non-driver workers can return immediately to avoid memory leak
-            # (storing cloned logits, metadata, scheduler_output on every worker)
-            if not self.is_driver_worker:
-                return self.get_empty_output()
+        # OPTIMIZATION: Only driver worker needs to defer sampling
+        # Non-driver workers can return immediately to avoid memory leak
+        # (storing cloned logits, metadata, scheduler_output on every worker)
+        if not self.is_driver_worker:
+            return self.get_empty_output()
 
-            # Defer sampling until grammar is ready (driver worker only)
-            self.defer_sampling(logits, is_prefill, scheduler_output)
-            return None
-
-        # Apply constraints
-        self.apply_constraints(scheduler_output, grammar_output, logits, is_prefill)
-
-        # Perform sampling and build output
-        sampling_metadata = self.get_sampling_metadata(is_prefill)
-        return self.perform_sampling(logits, sampling_metadata, is_prefill, scheduler_output, t0)
+        # Always defer sampling - let the engine call it afterwards
+        self.defer_sampling(logits, is_prefill, scheduler_output)
+        return None
 
     def prefill_output(self) -> SpyreModelRunnerOutput:
         req_id_to_index = self.get_req_id_to_index(is_prefill=True)
@@ -1828,14 +1750,10 @@ class ChunkedPrefillModelRunner(
             ModelRunnerOutput for driver worker, None for non-driver workers.
         """
         # Verify pending state exists
-        # Use explicit check instead of assert to ensure it's not removed by python -O
-        if self._pending_sampling_state is None:
-            raise RuntimeError(
-                "sample_tokens() called but no pending sampling state exists. "
-                "This indicates sample_tokens() was called without prior defer_sampling(), "
-                "or the state was already cleared."
-            )
-
+        assert self._pending_sampling_state is not None, (
+            "sample_tokens() called but no pending sampling state exists. "
+            "This indicates defer_sampling() was not called or state was already consumed."
+        )
         # Retrieve stored sampling context
         state = self._pending_sampling_state
         logits = state.logits
@@ -1846,12 +1764,9 @@ class ChunkedPrefillModelRunner(
         # Clear the pending state
         self._pending_sampling_state = None
 
-        # Apply constraints
-        self.apply_constraints(stored_scheduler_output, grammar_output, logits, is_prefill)
-
         # Perform sampling and build output
         return self.perform_sampling(
-            logits, sampling_metadata, is_prefill, stored_scheduler_output, t0=0
+            logits, sampling_metadata, is_prefill, stored_scheduler_output, grammar_output, t0=0
         )
 
     def sampled_output(self, output: SamplerOutput, is_prefill: bool) -> SpyreModelRunnerOutput:

@@ -777,7 +777,17 @@ class SpyreWorker(WorkerBase):
     ) -> ModelRunnerOutput | None:
         if self.profiler is not None:
             self.profiler.step()
+        
+        # Execute model
         output = self.model_runner.execute_model(scheduler_output)
+        
+        # For sampling models (ChunkedPrefillModelRunner), execute_model returns None
+        # and we need to call sample_tokens to complete the deferred sampling.
+        # For pooling models (SpyrePoolingModelRunner), execute_model returns output directly.
+        if output is None:
+            grammar_output = getattr(scheduler_output, "_spyre_grammar_output", None)
+            output = self.model_runner.sample_tokens(grammar_output)  # type: ignore[attr-defined]
+        
         return output if self.is_driver_worker else None
 
     def _get_num_tokens(self, r: NewRequestData) -> int:
