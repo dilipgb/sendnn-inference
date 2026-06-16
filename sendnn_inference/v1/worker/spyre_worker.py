@@ -7,6 +7,7 @@ import os
 import platform
 import signal
 import sys
+import threading
 import time
 import math
 from datetime import timedelta
@@ -33,11 +34,6 @@ try:
 except ImportError:
     CompilationTimes = None  # type: ignore[assignment, misc]
     from vllm.v1.worker.worker_base import WorkerBase
-
-if TYPE_CHECKING:
-    from vllm.v1.structured_output.utils import GrammarOutput
-else:
-    GrammarOutput = None
 
 import sendnn_inference.envs as envs_spyre
 import sendnn_inference.perf_metrics as perf_metrics
@@ -261,6 +257,9 @@ class SpyreWorker(WorkerBase):
 
         # For power-user debugging of spyre logs for tensor parallel ops
         self.redirect_logs_to_files()
+
+        # Store reference to scheduler for async grammar building
+        self._scheduler = None
 
         self.perf_metrics = perf_metrics.create_perf_metric_logger(rank)
         if self.parallel_config and is_driver_worker:
@@ -779,36 +778,39 @@ class SpyreWorker(WorkerBase):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
+    
+    def set_scheduler(self, scheduler) -> None:
+        """Set the scheduler reference for async grammar building."""
+        self._scheduler = scheduler
 
     @SpyrePlatform.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-        grammar_output: "GrammarOutput | None" = None,
     ) -> ModelRunnerOutput | None:
-        """Execute the model and complete sampling.
-        
-        Args:
-            scheduler_output: The scheduler output containing request information.
-            grammar_output: The grammar output with bitmasks to apply. This should be
-                built asynchronously by the engine while the model is running.
-                If None, no grammar constraints are applied.
-        
-        Returns:
-            The model runner output, or None if not the driver worker.
-        """
         if self.profiler is not None:
             self.profiler.step()
         
-        # Execute model (for sampling models, this defers sampling and returns None)
+        # Start building grammar asynchronously in a thread while model runs
+        grammar_result: list = [None]  # Use list to allow modification in thread
+        grammar_exception: list = [None]  # type: ignore[assignment]
+        
+        def build_grammar_async():
+            if self._scheduler is not None:
+                grammar_result[0] = self._scheduler.get_grammar_bitmask(scheduler_output)
+        grammar_thread = threading.Thread(target=build_grammar_async, daemon=True)
+        grammar_thread.start()
+        
+        # Execute model (this will take time, allowing grammar to build in parallel)
         output = self.model_runner.execute_model(scheduler_output)
         
         # For sampling models (ChunkedPrefillModelRunner), execute_model returns None
         # and we need to call sample_tokens to complete the deferred sampling.
         # For pooling models (SpyrePoolingModelRunner), execute_model returns output directly.
         if output is None:
-            grammar_output = getattr(scheduler_output, "_spyre_grammar_output", None)
-            # Complete sampling with the grammar bitmask that was built asynchronously
+            # Wait for grammar building to complete
+            grammar_thread.join()
+            grammar_output = grammar_result[0]
             output = self.model_runner.sample_tokens(grammar_output)  # type: ignore[attr-defined]
         
         return output if self.is_driver_worker else None

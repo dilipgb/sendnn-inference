@@ -126,8 +126,8 @@ class PoolingSpyreScheduler(SpyreScheduler):
         while holdback_queue:
             self.waiting.append(holdback_queue.popleft())
 
-        # Grammar bitmask is now built asynchronously by the engine while the model runs.
-        # The model runner's sample_tokens() method will be called with the grammar output.
+        # Don't build grammar synchronously here - let it be built asynchronously
+        # The worker will retrieve it via scheduler.get_grammar_bitmask() if needed
         return outputs
 
     def _get_matching_warmup_shapes(
@@ -378,8 +378,7 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         ):
             logger.debug("Scheduled tokens in this step: %s", outputs.num_scheduled_tokens)
 
-        # Grammar bitmask is now built asynchronously by the engine while the model runs.
-        # The model runner's sample_tokens() method will be called with the grammar output.
+        outputs._spyre_grammar_output = self.get_grammar_bitmask(outputs)  # type: ignore[attr-defined]
         return outputs
 
     def can_schedule_prefill(self, request: Request) -> bool:
