@@ -44,8 +44,10 @@ class SpyreScheduler(Scheduler):
         self._grammar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grammar")
         self._grammar_future: Future | None = None
     
-    def start_grammar_build(self, outputs: "SchedulerOutput") -> Future | None:
-        """Start building grammar asynchronously and return the future.
+    def start_grammar_build(self) -> Future | None:
+        """Return the grammar future created by the last schedule() call.
+        
+        Must be called immediately after schedule() and before the next schedule() call.
         
         Returns:
             Future that will contain the grammar output, or None if no grammar needed.
@@ -153,9 +155,14 @@ class PoolingSpyreScheduler(SpyreScheduler):
             self.waiting.append(holdback_queue.popleft())
 
         # Start building grammar asynchronously in background thread
-        self._grammar_future = self._grammar_executor.submit(
+        grammar_future = self._grammar_executor.submit(
             self.get_grammar_bitmask, outputs
         )
+        
+        # Attach the future to the outputs so the worker can access it
+        # This avoids the need for the worker to call back to the scheduler
+        outputs.grammar_future = grammar_future  # type: ignore[attr-defined]
+        
         return outputs
 
     def _get_matching_warmup_shapes(
@@ -407,9 +414,14 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
             logger.debug("Scheduled tokens in this step: %s", outputs.num_scheduled_tokens)
 
         # Start building grammar asynchronously in background thread
-        self._grammar_future = self._grammar_executor.submit(
+        grammar_future = self._grammar_executor.submit(
             self.get_grammar_bitmask, outputs
         )
+        
+        # Attach the future to the outputs so the worker can access it
+        # This avoids the need for the worker to call back to the scheduler
+        outputs.grammar_future = grammar_future  # type: ignore[attr-defined]
+        
         return outputs
 
     def can_schedule_prefill(self, request: Request) -> bool:

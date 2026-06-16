@@ -785,6 +785,11 @@ class SpyreWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
         
+        # Extract grammar_future from scheduler_output if not provided
+        # The scheduler attaches the future to the output object
+        if grammar_future is None:
+            grammar_future = getattr(scheduler_output, 'grammar_future', None)
+        
         # Execute model (grammar is being built asynchronously in background)
         output = self.model_runner.execute_model(scheduler_output, grammar_future)
         
