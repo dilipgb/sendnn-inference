@@ -2,6 +2,7 @@ import copy
 import math
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union
 
@@ -109,8 +110,8 @@ class SamplingState:
 
     logits: torch.Tensor
     metadata: "SamplingMetadata"
-    is_prefill: bool
     scheduler_output: "SchedulerOutput"
+    grammar_future: "Future | None"
 
 
 InputBatchT = TypeVar("InputBatchT", bound=BaseInputBatch)
@@ -621,6 +622,7 @@ class SpyrePoolingModelRunner(
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
+        grammar_future: "Future | None" = None,
         **kwargs,
     ) -> ModelRunnerOutput:
         t0 = time.time()
@@ -1552,8 +1554,9 @@ class ChunkedPrefillModelRunner(
     def defer_sampling(
         self,
         logits: torch.Tensor,
-        is_prefill: bool,
+        metadata: "SamplingMetadata",
         scheduler_output: "SchedulerOutput",
+        grammar_future: "Future | None",
     ) -> None:
         """Defer sampling until grammar bitmask is ready.
 
@@ -1564,21 +1567,18 @@ class ChunkedPrefillModelRunner(
             "Multiple deferred sampling batches are not supported. "
             "Previous batch must be consumed via sample_tokens() before deferring another."
         )
-        metadata = copy.deepcopy(self.get_sampling_metadata(is_prefill))
-        scheduler_output_copy = copy.deepcopy(scheduler_output)
         self._pending_sampling_state = SamplingState(
             logits=logits.clone(),  # Clone to prevent reuse bugs (expensive but necessary)
-            metadata=metadata,  # Deep copied to prevent mutation
-            is_prefill=is_prefill,
-            scheduler_output=scheduler_output_copy,  # Deep copied to prevent mutation/recycling
+            metadata=metadata,  # Already deep copied by caller
+            scheduler_output=scheduler_output,  # Already deep copied by caller
+            grammar_future=grammar_future,
         )
 
         # Log debug message to help detect cleanup issues
         logger.debug(
-            "Deferred sampling for batch (is_prefill=%s). "
+            "Deferred sampling for batch. "
             "If this message appears without corresponding sample_tokens(), "
             "there is a memory leak.",
-            is_prefill,
         )
 
     def clear_pending_sampling(self) -> None:
@@ -1659,6 +1659,7 @@ class ChunkedPrefillModelRunner(
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
+        grammar_future: "Future | None" = None,
         **kwargs,
     ) -> ModelRunnerOutput | None:
         t0 = time.time()
@@ -1710,7 +1711,9 @@ class ChunkedPrefillModelRunner(
         # Always defer sampling - let the engine call sample_tokens afterwards
         # All workers (including non-driver) need to defer so they can update
         # their request states with sampled tokens via sample_tokens/perform_sampling
-        self.defer_sampling(logits, is_prefill, scheduler_output)
+        metadata = copy.deepcopy(self.get_sampling_metadata(is_prefill))
+        scheduler_output_copy = copy.deepcopy(scheduler_output)
+        self.defer_sampling(logits, metadata, scheduler_output_copy, grammar_future)
         return None
 
     def prefill_output(self) -> SpyreModelRunnerOutput:
@@ -1732,15 +1735,11 @@ class ChunkedPrefillModelRunner(
             prefix_cache_hit_len=self.get_prefix_cache_len(),
         )
 
-    def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput | None:
+    def sample_tokens(self) -> ModelRunnerOutput | None:
         """Complete sampling with the grammar bitmask after async grammar building.
 
         This is called by the engine after grammar bitmasks have been built
         asynchronously while the model was running.
-
-        Args:
-            grammar_output: The grammar output generated asynchronously by the engine.
-                           Can be None if no grammar constraints are needed.
 
         Returns:
             ModelRunnerOutput for driver worker, None for non-driver workers.
@@ -1754,11 +1753,18 @@ class ChunkedPrefillModelRunner(
         state = self._pending_sampling_state
         logits = state.logits
         sampling_metadata = state.metadata
-        is_prefill = state.is_prefill
         stored_scheduler_output = state.scheduler_output
+        
+        # Get grammar output from the future
+        grammar_output = None
+        if state.grammar_future is not None:
+            grammar_output = state.grammar_future.result()
 
         # Clear the pending state
         self._pending_sampling_state = None
+
+        # Determine if this is prefill based on the batch
+        is_prefill = len(stored_scheduler_output.scheduled_new_reqs) > 0
 
         # Perform sampling and build output
         return self.perform_sampling(

@@ -44,7 +44,21 @@ class SpyreScheduler(Scheduler):
         self._grammar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grammar")
         self._grammar_future: Future | None = None
     
+    def start_grammar_build(self, outputs: "SchedulerOutput") -> Future | None:
+        """Start building grammar asynchronously and return the future.
+        
+        Returns:
+            Future that will contain the grammar output, or None if no grammar needed.
+        """
+        future = self._grammar_future
+        self._grammar_future = None
+        return future
+    
     def get_grammar_output_async(self):
+        """Get grammar output synchronously (blocks until ready).
+        
+        This is kept for backward compatibility but start_grammar_build is preferred.
+        """
         future = self._grammar_future
         self._grammar_future = None
 

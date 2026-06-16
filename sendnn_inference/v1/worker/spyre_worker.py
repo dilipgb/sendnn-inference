@@ -9,6 +9,7 @@ import signal
 import sys
 import time
 import math
+from concurrent.futures import Future
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Union, cast
@@ -256,9 +257,6 @@ class SpyreWorker(WorkerBase):
 
         # For power-user debugging of spyre logs for tensor parallel ops
         self.redirect_logs_to_files()
-
-        # Store reference to scheduler for async grammar building
-        self._scheduler = None
 
         self.perf_metrics = perf_metrics.create_perf_metric_logger(rank)
         if self.parallel_config and is_driver_worker:
@@ -777,32 +775,24 @@ class SpyreWorker(WorkerBase):
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
-    
-    def set_scheduler(self, scheduler) -> None:
-        """Set the scheduler reference for async grammar building."""
-        self._scheduler = scheduler
 
     @SpyrePlatform.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
+        grammar_future: "Future | None" = None,
     ) -> ModelRunnerOutput | None:
         if self.profiler is not None:
             self.profiler.step()
         
-        # Execute model (grammar is being built asynchronously in scheduler)
-        output = self.model_runner.execute_model(scheduler_output)
+        # Execute model (grammar is being built asynchronously in background)
+        output = self.model_runner.execute_model(scheduler_output, grammar_future)
         
         # For sampling models (ChunkedPrefillModelRunner), execute_model returns None
         # and we need to call sample_tokens to complete the deferred sampling.
         # For pooling models (SpyrePoolingModelRunner), execute_model returns output directly.
         if output is None:
-            # Wait for grammar building to complete and get the result
-            grammar_output = None
-            if self._scheduler is not None:
-                grammar_output = self._scheduler.get_grammar_output_async()
-            
-            output = self.model_runner.sample_tokens(grammar_output)  # type: ignore[attr-defined]
+            output = self.model_runner.sample_tokens()  # type: ignore[attr-defined]
         
         return output if self.is_driver_worker else None
 
