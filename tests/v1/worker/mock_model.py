@@ -140,7 +140,6 @@ class InstrumentedModelRunner(ChunkedPrefillModelRunner):
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
-        grammar_future=None,
         **kwargs,
     ) -> ModelRunnerOutput:
         # These variables are here for future test scenarios to use

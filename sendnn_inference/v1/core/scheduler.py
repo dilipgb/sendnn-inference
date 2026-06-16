@@ -2,7 +2,6 @@
 
 import math
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Iterable, Union
 
 from vllm.logger import init_logger
@@ -40,34 +39,7 @@ class SpyreScheduler(Scheduler):
         # Initialize vLLM scheduler
         super().__init__(*args, **kwargs)
         self.model_config = self.vllm_config.model_config
-        # Thread pool for async grammar building
-        self._grammar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grammar")
-        self._grammar_future: Future | None = None
-    
-    def start_grammar_build(self) -> Future | None:
-        """Return the grammar future created by the last schedule() call.
-        
-        Must be called immediately after schedule() and before the next schedule() call.
-        
-        Returns:
-            Future that will contain the grammar output, or None if no grammar needed.
-        """
-        future = self._grammar_future
-        self._grammar_future = None
-        return future
-    
-    def get_grammar_output_async(self):
-        """Get grammar output synchronously (blocks until ready).
-        
-        This is kept for backward compatibility but start_grammar_build is preferred.
-        """
-        future = self._grammar_future
-        self._grammar_future = None
 
-        if future is None:
-            return None
-
-        return future.result()
 
 class PoolingSpyreScheduler(SpyreScheduler):
     """Support of pooling models"""
@@ -154,15 +126,7 @@ class PoolingSpyreScheduler(SpyreScheduler):
         while holdback_queue:
             self.waiting.append(holdback_queue.popleft())
 
-        # Start building grammar asynchronously in background thread
-        grammar_future = self._grammar_executor.submit(
-            self.get_grammar_bitmask, outputs
-        )
-        
-        # Attach the future to the outputs so the worker can access it
-        # This avoids the need for the worker to call back to the scheduler
-        outputs.grammar_future = grammar_future  # type: ignore[attr-defined]
-        
+        outputs._spyre_grammar_output = self.get_grammar_bitmask(outputs)  # type: ignore[attr-defined]
         return outputs
 
     def _get_matching_warmup_shapes(
@@ -413,15 +377,14 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         ):
             logger.debug("Scheduled tokens in this step: %s", outputs.num_scheduled_tokens)
 
-        # Start building grammar asynchronously in background thread
-        grammar_future = self._grammar_executor.submit(
-            self.get_grammar_bitmask, outputs
-        )
-        
-        # Attach the future to the outputs so the worker can access it
-        # This avoids the need for the worker to call back to the scheduler
-        outputs.grammar_future = grammar_future  # type: ignore[attr-defined]
-        
+        # Collect grammar bitmask synchronously for structured outputs.
+        # NOTE: This is done here because vllm-spyre currently combines token sampling
+        # in model_executor.execute_model() rather than implementing sample_tokens()
+        # in the model runner. This means we cannot collect the grammar bitmask
+        # asynchronously while the model is running (as done in vLLM core).
+        # TODO: Implement sample_tokens() in SpyreModelRunner to enable async grammar
+        # collection for better performance.
+        outputs._spyre_grammar_output = self.get_grammar_bitmask(outputs)  # type: ignore[attr-defined]
         return outputs
 
     def can_schedule_prefill(self, request: Request) -> bool:

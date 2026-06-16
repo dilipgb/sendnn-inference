@@ -9,7 +9,6 @@ import signal
 import sys
 import time
 import math
-from concurrent.futures import Future
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Union, cast
@@ -692,14 +691,7 @@ class SpyreWorker(WorkerBase):
 
             self.execute_model(scheduler_output)
 
-        # Add fake sampled tokens to request states for decode warmup
-        # (since we now defer sampling, we need to manually populate output_token_ids)
-        # Only needed for sampling models (ChunkedPrefillModelRunner), not pooling models
-        if isinstance(self.model_runner, ChunkedPrefillModelRunner):
-            random_token_id = lambda: torch.randint(0, len(valid_token_ids_tensor), (1,)).item()
-            for req in requests:
-                fake_token = valid_token_ids_tensor[random_token_id()].item()
-                self.model_runner.requests[req.req_id].append_output_token_ids(fake_token)
+        random_token_id = lambda: torch.randint(0, len(valid_token_ids_tensor), (1,)).item()
 
         cached_request_data = CachedRequestData.make_empty()
         cached_request_data.req_ids = [req.req_id for req in requests]
@@ -709,7 +701,9 @@ class SpyreWorker(WorkerBase):
                 cached_request_data.new_block_ids.append(self._gen_warmup_block_ids(1))
             else:
                 cached_request_data.new_block_ids.append(([],))
-        cached_request_data.new_token_ids = []
+        cached_request_data.new_token_ids = [
+            [valid_token_ids_tensor[random_token_id()]] for _ in requests
+        ]
         cached_request_data.num_computed_tokens = [prompt_len for _ in requests]
 
         scheduler_output = SchedulerOutput(
@@ -780,25 +774,10 @@ class SpyreWorker(WorkerBase):
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-        grammar_future: "Future | None" = None,
     ) -> ModelRunnerOutput | None:
         if self.profiler is not None:
             self.profiler.step()
-        
-        # Extract grammar_future from scheduler_output if not provided
-        # The scheduler attaches the future to the output object
-        if grammar_future is None:
-            grammar_future = getattr(scheduler_output, 'grammar_future', None)
-        
-        # Execute model (grammar is being built asynchronously in background)
-        output = self.model_runner.execute_model(scheduler_output, grammar_future)
-        
-        # For sampling models (ChunkedPrefillModelRunner), execute_model returns None
-        # and we need to call sample_tokens to complete the deferred sampling.
-        # For pooling models (SpyrePoolingModelRunner), execute_model returns output directly.
-        if output is None:
-            output = self.model_runner.sample_tokens()  # type: ignore[attr-defined]
-        
+        output = self.model_runner.execute_model(scheduler_output)
         return output if self.is_driver_worker else None
 
     def _get_num_tokens(self, r: NewRequestData) -> int:
