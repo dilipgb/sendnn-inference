@@ -2,6 +2,7 @@
 
 import math
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Iterable, Union
 
 from vllm.logger import init_logger
@@ -39,7 +40,18 @@ class SpyreScheduler(Scheduler):
         # Initialize vLLM scheduler
         super().__init__(*args, **kwargs)
         self.model_config = self.vllm_config.model_config
+        # Thread pool for async grammar building
+        self._grammar_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grammar")
+        self._grammar_future: Future | None = None
+    
+    def get_grammar_output_async(self):
+        future = self._grammar_future
+        self._grammar_future = None
 
+        if future is None:
+            return None
+
+        return future.result()
 
 class PoolingSpyreScheduler(SpyreScheduler):
     """Support of pooling models"""
@@ -126,8 +138,10 @@ class PoolingSpyreScheduler(SpyreScheduler):
         while holdback_queue:
             self.waiting.append(holdback_queue.popleft())
 
-        # Don't build grammar synchronously here - let it be built asynchronously
-        # The worker will retrieve it via scheduler.get_grammar_bitmask() if needed
+        # Start building grammar asynchronously in background thread
+        self._grammar_future = self._grammar_executor.submit(
+            self.get_grammar_bitmask, outputs
+        )
         return outputs
 
     def _get_matching_warmup_shapes(
@@ -378,7 +392,10 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         ):
             logger.debug("Scheduled tokens in this step: %s", outputs.num_scheduled_tokens)
 
-        outputs._spyre_grammar_output = self.get_grammar_bitmask(outputs)  # type: ignore[attr-defined]
+        # Start building grammar asynchronously in background thread
+        self._grammar_future = self._grammar_executor.submit(
+            self.get_grammar_bitmask, outputs
+        )
         return outputs
 
     def can_schedule_prefill(self, request: Request) -> bool:

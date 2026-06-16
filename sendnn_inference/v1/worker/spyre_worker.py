@@ -7,7 +7,6 @@ import os
 import platform
 import signal
 import sys
-import threading
 import time
 import math
 from datetime import timedelta
@@ -791,26 +790,18 @@ class SpyreWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
         
-        # Start building grammar asynchronously in a thread while model runs
-        grammar_result: list = [None]  # Use list to allow modification in thread
-        grammar_exception: list = [None]  # type: ignore[assignment]
-        
-        def build_grammar_async():
-            if self._scheduler is not None:
-                grammar_result[0] = self._scheduler.get_grammar_bitmask(scheduler_output)
-        grammar_thread = threading.Thread(target=build_grammar_async, daemon=True)
-        grammar_thread.start()
-        
-        # Execute model (this will take time, allowing grammar to build in parallel)
+        # Execute model (grammar is being built asynchronously in scheduler)
         output = self.model_runner.execute_model(scheduler_output)
         
         # For sampling models (ChunkedPrefillModelRunner), execute_model returns None
         # and we need to call sample_tokens to complete the deferred sampling.
         # For pooling models (SpyrePoolingModelRunner), execute_model returns output directly.
         if output is None:
-            # Wait for grammar building to complete
-            grammar_thread.join()
-            grammar_output = grammar_result[0]
+            # Wait for grammar building to complete and get the result
+            grammar_output = None
+            if self._scheduler is not None:
+                grammar_output = self._scheduler.get_grammar_output_async()
+            
             output = self.model_runner.sample_tokens(grammar_output)  # type: ignore[attr-defined]
         
         return output if self.is_driver_worker else None
