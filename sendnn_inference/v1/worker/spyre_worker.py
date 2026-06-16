@@ -34,6 +34,11 @@ except ImportError:
     CompilationTimes = None  # type: ignore[assignment, misc]
     from vllm.v1.worker.worker_base import WorkerBase
 
+if TYPE_CHECKING:
+    from vllm.v1.structured_output.utils import GrammarOutput
+else:
+    GrammarOutput = None
+
 import sendnn_inference.envs as envs_spyre
 import sendnn_inference.perf_metrics as perf_metrics
 import sendnn_inference.utils as utils_spyre
@@ -779,11 +784,23 @@ class SpyreWorker(WorkerBase):
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
+        grammar_output: "GrammarOutput | None" = None,
     ) -> ModelRunnerOutput | None:
+        """Execute the model and complete sampling.
+        
+        Args:
+            scheduler_output: The scheduler output containing request information.
+            grammar_output: The grammar output with bitmasks to apply. This should be
+                built asynchronously by the engine while the model is running.
+                If None, no grammar constraints are applied.
+        
+        Returns:
+            The model runner output, or None if not the driver worker.
+        """
         if self.profiler is not None:
             self.profiler.step()
         
-        # Execute model
+        # Execute model (for sampling models, this defers sampling and returns None)
         output = self.model_runner.execute_model(scheduler_output)
         
         # For sampling models (ChunkedPrefillModelRunner), execute_model returns None
@@ -791,6 +808,7 @@ class SpyreWorker(WorkerBase):
         # For pooling models (SpyrePoolingModelRunner), execute_model returns output directly.
         if output is None:
             grammar_output = getattr(scheduler_output, "_spyre_grammar_output", None)
+            # Complete sampling with the grammar bitmask that was built asynchronously
             output = self.model_runner.sample_tokens(grammar_output)  # type: ignore[attr-defined]
         
         return output if self.is_driver_worker else None
