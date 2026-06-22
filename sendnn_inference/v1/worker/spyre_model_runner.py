@@ -1584,6 +1584,10 @@ class ChunkedPrefillModelRunner(
 
         Stores the current sampling context for later completion.
         """
+        logger.info(
+            "[STRUCTURED] defer_sampling req_ids=%s",
+            scheduler_output.num_scheduled_tokens.keys()
+        )
         # Protect against double defer (batch A overwriting batch B)
         if self._pending_sampling_state is not None:
             raise RuntimeError(
@@ -1830,6 +1834,12 @@ class ChunkedPrefillModelRunner(
         """
         # Verify pending state exists
         # Use explicit check instead of assert to ensure it's not removed by python -O
+
+        logger.info(
+            "[STRUCTURED] sample_tokens called. grammar_output=%s",
+            grammar_output is not None,
+        )
+
         if self._pending_sampling_state is None:
             raise RuntimeError(
                 "sample_tokens() called but no pending sampling state exists. "
@@ -1846,6 +1856,12 @@ class ChunkedPrefillModelRunner(
 
         # Clear the pending state
         self._pending_sampling_state = None
+
+        logger.info(
+            "grammar_output=%s",
+            grammar_output is not None,
+        )
+
 
         # Apply constraints
         self.apply_constraints(stored_scheduler_output, grammar_output, logits, is_prefill)
