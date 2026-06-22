@@ -1541,6 +1541,10 @@ class ChunkedPrefillModelRunner(
             batch: The input batch containing request information.
         """
 
+        logger.info(
+            "[STRUCTURED] apply_grammar_bitmask called"
+            )
+
         expected_reqs = list(scheduler_output.num_scheduled_tokens.keys())
         actual_reqs = (
             batch.sorted_requests_ids
