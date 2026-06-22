@@ -255,6 +255,8 @@ class SpyreWorker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
+        logger.error("SPYRE WORKER MODULE LOADED")
+
         # For power-user debugging of spyre logs for tensor parallel ops
         self.redirect_logs_to_files()
 
