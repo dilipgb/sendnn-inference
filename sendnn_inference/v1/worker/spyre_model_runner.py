@@ -1540,28 +1540,39 @@ class ChunkedPrefillModelRunner(
             GrammarOutput with bitmasks if any requests need grammar constraints,
             None otherwise.
         """
-        from vllm.v1.structured_output.utils import get_grammar_bitmask
+        import numpy as np
+        from vllm.v1.core.sched.output import GrammarOutput
         
-        # Collect request IDs that need grammar constraints
+        # Collect request IDs that need grammar constraints and their grammars
         req_ids_with_grammar = []
+        grammars = []
+        
         for req_id in scheduler_output.num_scheduled_tokens.keys():
             req_state = self.requests.get(req_id)
             if req_state and req_state.structured_output_request:
                 so_req = req_state.structured_output_request
                 if so_req.grammar is not None:
                     req_ids_with_grammar.append(req_id)
+                    grammars.append(so_req.grammar)
         
         if not req_ids_with_grammar:
             return None
         
-        # Build a mapping of req_id -> grammar
-        req_id_to_grammar = {}
-        for req_id in req_ids_with_grammar:
-            req_state = self.requests[req_id]
-            req_id_to_grammar[req_id] = req_state.structured_output_request.grammar
+        # Generate bitmasks for each grammar
+        # Each grammar has a get_bitmask() method that returns the current bitmask
+        bitmasks = []
+        for grammar in grammars:
+            bitmask = grammar.get_bitmask()
+            bitmasks.append(bitmask)
         
-        # Generate the grammar bitmask using vLLM's utility
-        return get_grammar_bitmask(scheduler_output, req_id_to_grammar)
+        # Stack bitmasks into a numpy array
+        grammar_bitmask = np.stack(bitmasks, axis=0)
+        
+        # Return GrammarOutput with the collected data
+        return GrammarOutput(
+            structured_output_request_ids=req_ids_with_grammar,
+            grammar_bitmask=grammar_bitmask,
+        )
 
     def apply_grammar_bitmask(
         self,
