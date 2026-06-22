@@ -44,6 +44,7 @@ from sendnn_inference.v1.worker.spyre_model_runner import (
     SpyrePoolingModelRunner,
     SupportedTask,
 )
+from vllm.v1.core.sched.output import GrammarOutput
 
 if TYPE_CHECKING:
     pass
@@ -779,6 +780,16 @@ class SpyreWorker(WorkerBase):
             self.profiler.step()
         output = self.model_runner.execute_model(scheduler_output)
         return output if self.is_driver_worker else None
+    
+    def sample_tokens(
+        self,
+        grammar_output: "GrammarOutput | None",
+        ):
+        logger.info(
+            "[STRUCTURED] SpyreWorker.sample_tokens grammar=%s",
+            grammar_output is not None,
+            )
+        return self.model_runner.sample_tokens(grammar_output)
 
     def _get_num_tokens(self, r: NewRequestData) -> int:
         assert r.prompt_token_ids is not None, "requests should have tokens!"
