@@ -1792,9 +1792,6 @@ class ChunkedPrefillModelRunner(
             logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
             return self.prefill_output()
 
-        # Apply constraints
-        self.apply_constraints(scheduler_output, grammar_output, logits, is_prefill)
-
         # Perform sampling and build output
         sampling_metadata = self.get_sampling_metadata(is_prefill)
         return self.perform_sampling(logits, sampling_metadata, is_prefill, scheduler_output, t0)
