@@ -1802,7 +1802,12 @@ class ChunkedPrefillModelRunner(
 
         # Perform sampling and build output
         sampling_metadata = self.get_sampling_metadata(is_prefill)
-        return self.perform_sampling(logits, sampling_metadata, is_prefill, scheduler_output, t0)
+        self.defer_sampling(
+            logits,
+            is_prefill,
+            scheduler_output,
+            )
+        return None
 
     def prefill_output(self) -> SpyreModelRunnerOutput:
         req_id_to_index = self.get_req_id_to_index(is_prefill=True)
