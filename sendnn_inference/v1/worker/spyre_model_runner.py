@@ -1325,6 +1325,9 @@ class ChunkedPrefillModelRunner(
         else:
             generator = None
 
+        # Get structured output request from the NewRequestData if available
+        structured_output_request = getattr(request, "structured_output_request", None)
+
         req_state = SamplingRequestState(
             generator=generator,
             req_id=req_id,
@@ -1337,6 +1340,7 @@ class ChunkedPrefillModelRunner(
             usable_blocks=chunk_plan.usable_cache_blocks,
             total_hit_blocks=chunk_plan.total_cache_blocks,
             block_ids=request.block_ids[0],  # we only support on kv cache group for now
+            structured_output_request=structured_output_request,
         )
 
         self.requests[req_id] = req_state
@@ -1518,6 +1522,46 @@ class ChunkedPrefillModelRunner(
                 "Cannot schedule a new prefill and running requests in the same execution"
             )
             self.add_new_request(scheduler_output.scheduled_new_reqs[0])
+
+    def get_grammar_bitmask(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> "GrammarOutput | None":
+        """Generate grammar bitmask for structured output requests.
+        
+        This method collects request IDs that need grammar constraints,
+        retrieves their grammars from the request states, and generates
+        the bitmask for token filtering.
+        
+        Args:
+            scheduler_output: The scheduler output containing request information.
+            
+        Returns:
+            GrammarOutput with bitmasks if any requests need grammar constraints,
+            None otherwise.
+        """
+        from vllm.v1.structured_output.utils import get_grammar_bitmask
+        
+        # Collect request IDs that need grammar constraints
+        req_ids_with_grammar = []
+        for req_id in scheduler_output.num_scheduled_tokens.keys():
+            req_state = self.requests.get(req_id)
+            if req_state and req_state.structured_output_request:
+                so_req = req_state.structured_output_request
+                if so_req.grammar is not None:
+                    req_ids_with_grammar.append(req_id)
+        
+        if not req_ids_with_grammar:
+            return None
+        
+        # Build a mapping of req_id -> grammar
+        req_id_to_grammar = {}
+        for req_id in req_ids_with_grammar:
+            req_state = self.requests[req_id]
+            req_id_to_grammar[req_id] = req_state.structured_output_request.grammar
+        
+        # Generate the grammar bitmask using vLLM's utility
+        return get_grammar_bitmask(scheduler_output, req_id_to_grammar)
 
     def apply_grammar_bitmask(
         self,
@@ -1774,19 +1818,10 @@ class ChunkedPrefillModelRunner(
             logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
             return self.prefill_output()
 
-        # Check if grammar is pending
-        grammar_output = getattr(scheduler_output, "_spyre_grammar_output", None)
-        grammar_req_ids = getattr(scheduler_output, "grammar_req_ids", None)
-        if grammar_output is None and grammar_req_ids is not None:
-            # OPTIMIZATION: Only driver worker needs to defer sampling
-            # Non-driver workers can return immediately to avoid memory leak
-            # (storing cloned logits, metadata, scheduler_output on every worker)
-            if not self.is_driver_worker:
-                return self.get_empty_output()
-
-            # Defer sampling until grammar is ready (driver worker only)
-            self.defer_sampling(logits, is_prefill, scheduler_output)
-            return None
+        # Generate grammar bitmask for structured output requests
+        # This is done in the model runner (not scheduler) because the worker
+        # owns the request states that contain the grammar objects.
+        grammar_output = self.get_grammar_bitmask(scheduler_output)
 
         # Apply constraints
         self.apply_constraints(scheduler_output, grammar_output, logits, is_prefill)

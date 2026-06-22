@@ -126,7 +126,6 @@ class PoolingSpyreScheduler(SpyreScheduler):
         while holdback_queue:
             self.waiting.append(holdback_queue.popleft())
 
-        outputs._spyre_grammar_output = self.get_grammar_bitmask(outputs)  # type: ignore[attr-defined]
         return outputs
 
     def _get_matching_warmup_shapes(
@@ -377,14 +376,6 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         ):
             logger.debug("Scheduled tokens in this step: %s", outputs.num_scheduled_tokens)
 
-        # Collect grammar bitmask synchronously for structured outputs.
-        # NOTE: This is done here because vllm-spyre currently combines token sampling
-        # in model_executor.execute_model() rather than implementing sample_tokens()
-        # in the model runner. This means we cannot collect the grammar bitmask
-        # asynchronously while the model is running (as done in vLLM core).
-        # TODO: Implement sample_tokens() in SpyreModelRunner to enable async grammar
-        # collection for better performance.
-        outputs._spyre_grammar_output = self.get_grammar_bitmask(outputs)  # type: ignore[attr-defined]
         return outputs
 
     def can_schedule_prefill(self, request: Request) -> bool:
