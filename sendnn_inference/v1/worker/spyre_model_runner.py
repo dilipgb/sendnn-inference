@@ -1165,7 +1165,7 @@ class ChunkedPrefillModelRunner(
         # We'll calculate tkv on the fly, it is the max num computed tokens
         # of a request since there is no tokens left padding, only for blocks
         tkv = 0
-        for req_id in req_ids:
+        for idx, req_id in enumerate(req_ids):
             # TODO: Will this always just be one token ID if there's no spec
             # or jump decoding?
 
@@ -1186,7 +1186,13 @@ class ChunkedPrefillModelRunner(
             slot_mapping.append(slot)
 
             # input token and position of the token generated in the last step
-            generation_token = req_state.output_token_ids[-1]
+            # During warmup or first decode step, output_token_ids may be empty,
+            # so use new_token_ids from cached_request_data
+            if req_state.output_token_ids:
+                generation_token = req_state.output_token_ids[-1]
+            else:
+                # Use the new token from cached_request_data (e.g., during warmup)
+                generation_token = cached_request_data.new_token_ids[idx][0]
             input_tokens.append([generation_token])
             input_positions.append([req_state.num_computed_tokens])
 
