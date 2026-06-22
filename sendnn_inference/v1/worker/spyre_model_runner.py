@@ -1523,57 +1523,6 @@ class ChunkedPrefillModelRunner(
             )
             self.add_new_request(scheduler_output.scheduled_new_reqs[0])
 
-    def get_grammar_bitmask(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> "GrammarOutput | None":
-        """Generate grammar bitmask for structured output requests.
-        
-        This method collects request IDs that need grammar constraints,
-        retrieves their grammars from the request states, and generates
-        the bitmask for token filtering.
-        
-        Args:
-            scheduler_output: The scheduler output containing request information.
-            
-        Returns:
-            GrammarOutput with bitmasks if any requests need grammar constraints,
-            None otherwise.
-        """
-        import numpy as np
-        from vllm.v1.core.sched.output import GrammarOutput
-        
-        # Collect request IDs that need grammar constraints and their grammars
-        req_ids_with_grammar = []
-        grammars = []
-        
-        for req_id in scheduler_output.num_scheduled_tokens.keys():
-            req_state = self.requests.get(req_id)
-            if req_state and req_state.structured_output_request:
-                so_req = req_state.structured_output_request
-                if so_req.grammar is not None:
-                    req_ids_with_grammar.append(req_id)
-                    grammars.append(so_req.grammar)
-        
-        if not req_ids_with_grammar:
-            return None
-        
-        # Generate bitmasks for each grammar
-        # Each grammar has a get_bitmask() method that returns the current bitmask
-        bitmasks = []
-        for grammar in grammars:
-            bitmask = grammar.get_bitmask()
-            bitmasks.append(bitmask)
-        
-        # Stack bitmasks into a numpy array
-        grammar_bitmask = np.stack(bitmasks, axis=0)
-        
-        # Return GrammarOutput with the collected data
-        return GrammarOutput(
-            structured_output_request_ids=req_ids_with_grammar,
-            grammar_bitmask=grammar_bitmask,
-        )
-
     def apply_grammar_bitmask(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1591,6 +1540,20 @@ class ChunkedPrefillModelRunner(
             logits: The logits tensor to modify in-place.
             batch: The input batch containing request information.
         """
+
+        expected_reqs = list(scheduler_output.num_scheduled_tokens.keys())
+        actual_reqs = (
+            batch.sorted_requests_ids
+            if hasattr(batch, "sorted_requests_ids")
+            else batch.req_ids
+            )
+        if expected_reqs != actual_reqs:
+            raise RuntimeError(
+                f"Grammar batch mismatch. "
+                f"Scheduler={expected_reqs}, "
+                f"Batch={actual_reqs}"
+            )
+
         if grammar_output is not None:
             # Note: Grammar output batch size validation is handled internally by
             # vllm_apply_grammar_bitmask. If there's a mismatch (e.g., requests
@@ -1828,11 +1791,6 @@ class ChunkedPrefillModelRunner(
             t1 = time.time() - t0
             logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
             return self.prefill_output()
-
-        # Generate grammar bitmask for structured output requests
-        # This is done in the model runner (not scheduler) because the worker
-        # owns the request states that contain the grammar objects.
-        grammar_output = self.get_grammar_bitmask(scheduler_output)
 
         # Apply constraints
         self.apply_constraints(scheduler_output, grammar_output, logits, is_prefill)
