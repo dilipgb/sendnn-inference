@@ -1553,7 +1553,9 @@ class ChunkedPrefillModelRunner(
             if hasattr(batch, "sorted_requests_ids")
             else batch.req_ids
             )
-        if expected_reqs != actual_reqs:
+        
+        # Verify that both lists contain the same requests (order may differ)
+        if set(expected_reqs) != set(actual_reqs):
             raise RuntimeError(
                 f"Grammar batch mismatch. "
                 f"Scheduler={expected_reqs}, "
