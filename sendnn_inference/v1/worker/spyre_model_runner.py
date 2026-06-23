@@ -1565,18 +1565,23 @@ class ChunkedPrefillModelRunner(
             # vllm_apply_grammar_bitmask. If there's a mismatch (e.g., requests
             # finished/aborted while grammar was building), it will raise an error.
 
-            class _DenseBatchAdapter:
-                def __init__(self, batch: SamplingInputBatch):
-                    self._batch = batch
-                    self.req_ids = batch.sorted_requests_ids
-
-                def __getattr__(self, name: str):
-                    return getattr(self._batch, name)
+            # Reorder the bitmask to match the batch order instead of scheduler order
+            # The grammar_output.bitmask is in scheduler order (expected_reqs),
+            # but we need it in batch order (actual_reqs)
+            if expected_reqs != actual_reqs and grammar_output.bitmask is not None:
+                # Create a mapping from scheduler order to batch order
+                scheduler_to_batch_idx = {
+                    req_id: actual_reqs.index(req_id)
+                    for req_id in expected_reqs
+                }
+                # Reorder the bitmask rows to match batch order
+                reorder_indices = [scheduler_to_batch_idx[req_id] for req_id in expected_reqs]
+                grammar_output.bitmask = grammar_output.bitmask[reorder_indices]
 
             vllm_apply_grammar_bitmask(
                 scheduler_output,
                 grammar_output,
-                _DenseBatchAdapter(batch),  # type: ignore[arg-type]
+                batch,  # type: ignore[arg-type]
                 logits,
             )
 
