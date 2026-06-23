@@ -111,7 +111,7 @@ class SamplingState:
     metadata: "SamplingMetadata"
     is_prefill: bool
     scheduler_output: "SchedulerOutput"
-    batch: "SamplingInputBatch"  # Store the batch to ensure correct request ordering
+    batch_req_ids: list[str]  # Store request IDs to validate batch consistency
 
 
 InputBatchT = TypeVar("InputBatchT", bound=BaseInputBatch)
@@ -1589,6 +1589,15 @@ class ChunkedPrefillModelRunner(
                     def __getattr__(self, name: str):
                         return getattr(self._batch, name)
 
+                logger.error(
+                    "Grammar apply: logits_batch=%d grammar_batch=%s expected_reqs=%s actual_reqs=%s",
+                    logits.shape[0],
+                    len(grammar_output.grammar_bitmask)
+                    if grammar_output is not None else 0,
+                    expected_reqs,
+                    actual_reqs,
+                    )
+
                 vllm_apply_grammar_bitmask(
                     scheduler_output,
                     grammar_output,
@@ -1602,6 +1611,14 @@ class ChunkedPrefillModelRunner(
                     inverse_reorder_indices[scheduler_idx] = batch_idx
                 logits[:] = logits_reordered[inverse_reorder_indices]
             else:
+                 logger.error(
+                    "Grammar apply: logits_batch=%d grammar_batch=%s expected_reqs=%s actual_reqs=%s",
+                    logits.shape[0],
+                    len(grammar_output.grammar_bitmask)
+                    if grammar_output is not None else 0,
+                    expected_reqs,
+                    actual_reqs,
+                    )
                 # Orders match, no reordering needed
                 vllm_apply_grammar_bitmask(
                     scheduler_output,
@@ -1662,17 +1679,22 @@ class ChunkedPrefillModelRunner(
             # Fall back to reference (risky but allows execution to continue)
             scheduler_output_copy = scheduler_output
 
-        # Store the current batch to ensure correct request ordering when applying grammar
-        # The batch may change between defer_sampling() and sample_tokens() due to
-        # request completions or new requests, so we must preserve the original batch
+        # Store the current batch request IDs to validate consistency when applying grammar
+        # The batch object itself is mutable and gets modified (requests added/removed),
+        # so we capture the request IDs at this point in time
         batch = self.prefill_batch if is_prefill else self.input_batch
+        batch_req_ids = list(
+            batch.sorted_requests_ids
+            if hasattr(batch, "sorted_requests_ids")
+            else batch.req_ids
+        )
 
         self._pending_sampling_state = SamplingState(
             logits=logits.clone(),  # Clone to prevent reuse bugs (expensive but necessary)
             metadata=metadata,  # Deep copied to prevent mutation
             is_prefill=is_prefill,
             scheduler_output=scheduler_output_copy,  # Deep copied to prevent mutation/recycling
-            batch=batch,  # Store batch to ensure correct request ordering
+            batch_req_ids=batch_req_ids,  # Store request IDs to validate batch consistency
         )
 
         # Log debug message to help detect cleanup issues
@@ -1890,17 +1912,41 @@ class ChunkedPrefillModelRunner(
         sampling_metadata = state.metadata
         is_prefill = state.is_prefill
         stored_scheduler_output = state.scheduler_output
-        stored_batch = state.batch
+        stored_batch_req_ids = state.batch_req_ids
 
         # Clear the pending state
         self._pending_sampling_state = None
 
-        # Apply constraints using the stored batch to ensure correct request ordering
+        # Get the current batch and validate it matches the stored request IDs
         # This is critical: the batch may have changed between defer_sampling() and
-        # sample_tokens() due to request completions or new requests. Using the stored
-        # batch ensures the grammar bitmask is applied to the correct requests.
+        # sample_tokens() due to request completions or new requests.
+        current_batch = self.prefill_batch if is_prefill else self.input_batch
+        current_batch_req_ids = list(
+            current_batch.sorted_requests_ids
+            if hasattr(current_batch, "sorted_requests_ids")
+            else current_batch.req_ids
+        )
+        
+        # If the batch has changed, we cannot safely apply the grammar bitmask
+        if set(stored_batch_req_ids) != set(current_batch_req_ids):
+            missing_reqs = set(stored_batch_req_ids) - set(current_batch_req_ids)
+            extra_reqs = set(current_batch_req_ids) - set(stored_batch_req_ids)
+            logger.error(
+                "Batch changed between defer_sampling() and sample_tokens(). "
+                "Stored batch had requests: %s, current batch has: %s. "
+                "Missing: %s, Extra: %s. Cannot apply grammar bitmask safely.",
+                stored_batch_req_ids, current_batch_req_ids, missing_reqs, extra_reqs
+            )
+            raise RuntimeError(
+                f"Batch mismatch in deferred sampling. "
+                f"Stored requests: {stored_batch_req_ids}, "
+                f"Current requests: {current_batch_req_ids}, "
+                f"Missing: {missing_reqs}, Extra: {extra_reqs}"
+            )
+
+        # Apply constraints using the current batch (which we've validated matches)
         self.apply_constraints(
-            stored_scheduler_output, grammar_output, logits, is_prefill, batch=stored_batch
+            stored_scheduler_output, grammar_output, logits, is_prefill, batch=current_batch
         )
 
         # Perform sampling and build output
