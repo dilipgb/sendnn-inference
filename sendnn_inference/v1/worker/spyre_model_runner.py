@@ -719,10 +719,6 @@ class ChunkedPrefillModelRunner(
 
         # State for async sampling (when grammar bitmask is being built)
         self._pending_sampling_state: SamplingState | None = None
-        
-        # Requests that finished while grammar sampling was pending
-        # These will be removed from the batch after sample_tokens() completes
-        self._deferred_finished_req_ids: list[str] = []
 
         # TODO: Remove this once we can prefill and decode in the same step
         self.prefill_batch = SamplingInputBatch(
@@ -1493,28 +1489,30 @@ class ChunkedPrefillModelRunner(
             req_state.num_computed_tokens = num_computed_tokens
 
         if scheduler_output.finished_req_ids:
-            # If there's pending sampling, defer request removal to preserve batch consistency
-            # The grammar output is being built for the current batch state, so we must not
-            # mutate the batch until after sample_tokens() completes
+            # If there's pending sampling, we have a problem:
+            # The grammar output will be built for the NEW scheduler state (after removing finished requests)
+            # but we stored the OLD scheduler state (before removing finished requests).
+            # We must clear the pending state and let the engine retry.
             if self._pending_sampling_state is not None:
-                logger.debug(
-                    "Deferring removal of finished requests while grammar sampling is pending. "
-                    "Finished request IDs: %s. Will remove after sample_tokens() completes.",
+                logger.warning(
+                    "Requests finished while grammar sampling was pending. "
+                    "Clearing pending state because grammar will be built for wrong batch. "
+                    "Finished request IDs: %s. Engine will retry sampling.",
                     scheduler_output.finished_req_ids,
                 )
-                self._deferred_finished_req_ids.extend(scheduler_output.finished_req_ids)
-            else:
-                # No pending sampling, safe to remove requests immediately
-                for req_id in scheduler_output.finished_req_ids:
-                    self.input_batch.remove_request(req_id)
-                    # Clean up request state to prevent memory leak
-                    # Without this, SamplingRequestState (including cached_mm_embeddings,
-                    # generators, block_ids) leaks for every completed request
-                    self.requests.pop(req_id, None)
-                    # TODO: Processing multiple removals at once can break alignment
-                    # of logitprocs. Refactor so that we can batch removals to the
-                    # `input_batch`
-                    self.input_batch.refresh_metadata()
+                self.clear_pending_sampling()
+            
+            # Remove finished requests from the batch
+            for req_id in scheduler_output.finished_req_ids:
+                self.input_batch.remove_request(req_id)
+                # Clean up request state to prevent memory leak
+                # Without this, SamplingRequestState (including cached_mm_embeddings,
+                # generators, block_ids) leaks for every completed request
+                self.requests.pop(req_id, None)
+                # TODO: Processing multiple removals at once can break alignment
+                # of logitprocs. Refactor so that we can batch removals to the
+                # `input_batch`
+                self.input_batch.refresh_metadata()
         else:
             # Due to logits processor we need to refresh metadata at each step
             self.input_batch.refresh_metadata()
@@ -1706,7 +1704,7 @@ class ChunkedPrefillModelRunner(
         """Clear any pending sampling state.
 
         This should be called on error paths or when aborting deferred sampling
-        to prevent memory leaks. Also processes any deferred request removals.
+        to prevent memory leaks.
 
         """
         if self._pending_sampling_state is not None:
@@ -1716,22 +1714,6 @@ class ChunkedPrefillModelRunner(
                 "Leaked state: logits (GPU memory), metadata, scheduler_output."
             )
         self._pending_sampling_state = None
-        
-        # Process any deferred request removals since sampling won't complete normally
-        if self._deferred_finished_req_ids:
-            logger.debug(
-                "Processing deferred request removals after clearing pending sampling. "
-                "Removing request IDs: %s",
-                self._deferred_finished_req_ids
-            )
-            for req_id in self._deferred_finished_req_ids:
-                self.input_batch.remove_request(req_id)
-                # Clean up request state to prevent memory leak
-                self.requests.pop(req_id, None)
-                self.input_batch.refresh_metadata()
-            
-            # Clear the deferred list
-            self._deferred_finished_req_ids = []
 
     def apply_constraints(
         self,
@@ -1930,7 +1912,7 @@ class ChunkedPrefillModelRunner(
         # Clear the pending state
         self._pending_sampling_state = None
 
-        # Get the current batch - it should match the stored batch since we deferred removals
+        # Get the current batch
         current_batch = self.prefill_batch if is_prefill else self.input_batch
         current_batch_req_ids = list(
             current_batch.sorted_requests_ids
@@ -1938,12 +1920,13 @@ class ChunkedPrefillModelRunner(
             else current_batch.req_ids
         )
         
-        # Validate batch consistency - with deferred removals, the batch should be unchanged
+        # Validate batch consistency
         # Compare exact lists (not sets) to catch ordering issues
         if stored_batch_req_ids != current_batch_req_ids:
             logger.error(
-                "Batch changed between defer_sampling() and sample_tokens() despite deferred removals. "
-                "Stored batch: %s, current batch: %s. This indicates a bug in batch management.",
+                "Batch changed between defer_sampling() and sample_tokens(). "
+                "Stored batch: %s, current batch: %s. "
+                "This indicates requests finished/aborted while grammar was building.",
                 stored_batch_req_ids, current_batch_req_ids
             )
             raise RuntimeError(
@@ -1958,30 +1941,9 @@ class ChunkedPrefillModelRunner(
         )
 
         # Perform sampling and build output
-        output = self.perform_sampling(
+        return self.perform_sampling(
             logits, sampling_metadata, is_prefill, stored_scheduler_output, t0=0
         )
-        
-        # Now that sampling is complete, process any deferred request removals
-        if self._deferred_finished_req_ids:
-            logger.debug(
-                "Processing deferred request removals after sample_tokens(). "
-                "Removing request IDs: %s",
-                self._deferred_finished_req_ids
-            )
-            for req_id in self._deferred_finished_req_ids:
-                self.input_batch.remove_request(req_id)
-                # Clean up request state to prevent memory leak
-                self.requests.pop(req_id, None)
-                # TODO: Processing multiple removals at once can break alignment
-                # of logitprocs. Refactor so that we can batch removals to the
-                # `input_batch`
-                self.input_batch.refresh_metadata()
-            
-            # Clear the deferred list
-            self._deferred_finished_req_ids = []
-        
-        return output
 
     def sampled_output(self, output: SamplerOutput, is_prefill: bool) -> SpyreModelRunnerOutput:
         req_id_to_index = self.get_req_id_to_index(is_prefill)
