@@ -111,6 +111,7 @@ class SamplingState:
     metadata: "SamplingMetadata"
     is_prefill: bool
     scheduler_output: "SchedulerOutput"
+    batch: "SamplingInputBatch"  # Store the batch to ensure correct request ordering
 
 
 InputBatchT = TypeVar("InputBatchT", bound=BaseInputBatch)
@@ -1661,11 +1662,17 @@ class ChunkedPrefillModelRunner(
             # Fall back to reference (risky but allows execution to continue)
             scheduler_output_copy = scheduler_output
 
+        # Store the current batch to ensure correct request ordering when applying grammar
+        # The batch may change between defer_sampling() and sample_tokens() due to
+        # request completions or new requests, so we must preserve the original batch
+        batch = self.prefill_batch if is_prefill else self.input_batch
+
         self._pending_sampling_state = SamplingState(
             logits=logits.clone(),  # Clone to prevent reuse bugs (expensive but necessary)
             metadata=metadata,  # Deep copied to prevent mutation
             is_prefill=is_prefill,
             scheduler_output=scheduler_output_copy,  # Deep copied to prevent mutation/recycling
+            batch=batch,  # Store batch to ensure correct request ordering
         )
 
         # Log debug message to help detect cleanup issues
@@ -1697,9 +1704,19 @@ class ChunkedPrefillModelRunner(
         grammar_output: "GrammarOutput | None",
         logits: torch.Tensor,
         is_prefill: bool,
+        batch: "SamplingInputBatch | None" = None,
     ) -> None:
-        """Apply grammar constraints to logits."""
-        batch = self.prefill_batch if is_prefill else self.input_batch
+        """Apply grammar constraints to logits.
+        
+        Args:
+            scheduler_output: The scheduler output for this batch.
+            grammar_output: The grammar output with bitmasks to apply.
+            logits: The logits tensor to modify.
+            is_prefill: Whether this is a prefill batch.
+            batch: The batch to use. If None, uses current batch from self.
+        """
+        if batch is None:
+            batch = self.prefill_batch if is_prefill else self.input_batch
         self.apply_grammar_bitmask(scheduler_output, grammar_output, logits, batch)
 
     def perform_sampling(
@@ -1873,12 +1890,18 @@ class ChunkedPrefillModelRunner(
         sampling_metadata = state.metadata
         is_prefill = state.is_prefill
         stored_scheduler_output = state.scheduler_output
+        stored_batch = state.batch
 
         # Clear the pending state
         self._pending_sampling_state = None
 
-        # Apply constraints
-        self.apply_constraints(stored_scheduler_output, grammar_output, logits, is_prefill)
+        # Apply constraints using the stored batch to ensure correct request ordering
+        # This is critical: the batch may have changed between defer_sampling() and
+        # sample_tokens() due to request completions or new requests. Using the stored
+        # batch ensures the grammar bitmask is applied to the correct requests.
+        self.apply_constraints(
+            stored_scheduler_output, grammar_output, logits, is_prefill, batch=stored_batch
+        )
 
         # Perform sampling and build output
         return self.perform_sampling(
