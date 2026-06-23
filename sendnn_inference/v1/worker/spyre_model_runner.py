@@ -1547,10 +1547,6 @@ class ChunkedPrefillModelRunner(
             batch: The input batch containing request information.
         """
 
-        logger.info(
-            "[STRUCTURED] apply_grammar_bitmask called"
-            )
-
         expected_reqs = list(scheduler_output.num_scheduled_tokens.keys())
         actual_reqs = (
             batch.sorted_requests_ids
@@ -1594,10 +1590,6 @@ class ChunkedPrefillModelRunner(
 
         Stores the current sampling context for later completion.
         """
-        logger.info(
-            "[STRUCTURED] defer_sampling req_ids=%s",
-            scheduler_output.num_scheduled_tokens.keys()
-        )
         # Protect against double defer (batch A overwriting batch B)
         if self._pending_sampling_state is not None:
             raise RuntimeError(
@@ -1661,16 +1653,6 @@ class ChunkedPrefillModelRunner(
         This should be called on error paths or when aborting deferred sampling
         to prevent memory leaks.
 
-        IMPORTANT: This method must be called in the following scenarios:
-        - Request cancellation before sample_tokens() is called
-        - Grammar build failure
-        - Worker shutdown
-        - Any error path after defer_sampling() but before sample_tokens()
-
-        Failure to call this will leak:
-        - Cloned logits tensor (GPU memory, ~4MB per batch for 16×128k vocab)
-        - SamplingMetadata references
-        - SchedulerOutput references
         """
         if self._pending_sampling_state is not None:
             logger.warning(
@@ -1849,12 +1831,6 @@ class ChunkedPrefillModelRunner(
         """
         # Verify pending state exists
         # Use explicit check instead of assert to ensure it's not removed by python -O
-
-        logger.info(
-            "[STRUCTURED] sample_tokens called. grammar_output=%s",
-            grammar_output is not None,
-        )
-
         if self._pending_sampling_state is None:
             raise RuntimeError(
                 "sample_tokens() called but no pending sampling state exists. "
@@ -1871,12 +1847,6 @@ class ChunkedPrefillModelRunner(
 
         # Clear the pending state
         self._pending_sampling_state = None
-
-        logger.info(
-            "grammar_output=%s",
-            grammar_output is not None,
-        )
-
 
         # Apply constraints
         self.apply_constraints(stored_scheduler_output, grammar_output, logits, is_prefill)

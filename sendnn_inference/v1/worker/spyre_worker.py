@@ -255,8 +255,6 @@ class SpyreWorker(WorkerBase):
             is_driver_worker=is_driver_worker,
         )
 
-        logger.error("SPYRE WORKER MODULE LOADED")
-
         # For power-user debugging of spyre logs for tensor parallel ops
         self.redirect_logs_to_files()
 
@@ -806,10 +804,6 @@ class SpyreWorker(WorkerBase):
         self,
         grammar_output: "GrammarOutput | None",
         ):
-        logger.info(
-            "[STRUCTURED] SpyreWorker.sample_tokens grammar=%s",
-            grammar_output is not None,
-            )
         return self.model_runner.sample_tokens(grammar_output)
 
     def _get_num_tokens(self, r: NewRequestData) -> int:
