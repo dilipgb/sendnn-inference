@@ -1567,25 +1567,47 @@ class ChunkedPrefillModelRunner(
             # vllm_apply_grammar_bitmask. If there's a mismatch (e.g., requests
             # finished/aborted while grammar was building), it will raise an error.
 
-            # Reorder the bitmask to match the batch order instead of scheduler order
-            # The grammar_output.bitmask is in scheduler order (expected_reqs),
-            # but we need it in batch order (actual_reqs)
-            if expected_reqs != actual_reqs and grammar_output.bitmask is not None:
-                # Create a mapping from scheduler order to batch order
-                scheduler_to_batch_idx = {
-                    req_id: actual_reqs.index(req_id)
-                    for req_id in expected_reqs
+            # If the request order differs between scheduler and batch, we need to
+            # reorder logits to match the scheduler order (which the grammar bitmask expects)
+            if expected_reqs != actual_reqs:
+                # Create a mapping from batch order to scheduler order
+                batch_to_scheduler_idx = {
+                    req_id: expected_reqs.index(req_id)
+                    for req_id in actual_reqs
                 }
-                # Reorder the bitmask rows to match batch order
-                reorder_indices = [scheduler_to_batch_idx[req_id] for req_id in expected_reqs]
-                grammar_output.bitmask = grammar_output.bitmask[reorder_indices]
+                # Reorder logits rows to match scheduler order
+                reorder_indices = [batch_to_scheduler_idx[req_id] for req_id in actual_reqs]
+                logits_reordered = logits[reorder_indices]
+                
+                # Apply grammar bitmask with scheduler-ordered batch adapter
+                class _SchedulerOrderedBatchAdapter:
+                    def __init__(self, batch: SamplingInputBatch, scheduler_req_ids: list[str]):
+                        self._batch = batch
+                        self.req_ids = scheduler_req_ids
 
-            vllm_apply_grammar_bitmask(
-                scheduler_output,
-                grammar_output,
-                batch,  # type: ignore[arg-type]
-                logits,
-            )
+                    def __getattr__(self, name: str):
+                        return getattr(self._batch, name)
+
+                vllm_apply_grammar_bitmask(
+                    scheduler_output,
+                    grammar_output,
+                    _SchedulerOrderedBatchAdapter(batch, expected_reqs),  # type: ignore[arg-type]
+                    logits_reordered,
+                )
+                
+                # Reorder logits back to batch order
+                inverse_reorder_indices = [0] * len(reorder_indices)
+                for batch_idx, scheduler_idx in enumerate(reorder_indices):
+                    inverse_reorder_indices[scheduler_idx] = batch_idx
+                logits[:] = logits_reordered[inverse_reorder_indices]
+            else:
+                # Orders match, no reordering needed
+                vllm_apply_grammar_bitmask(
+                    scheduler_output,
+                    grammar_output,
+                    batch,  # type: ignore[arg-type]
+                    logits,
+                )
 
     def defer_sampling(
         self,
