@@ -1611,7 +1611,7 @@ class ChunkedPrefillModelRunner(
                     inverse_reorder_indices[scheduler_idx] = batch_idx
                 logits[:] = logits_reordered[inverse_reorder_indices]
             else:
-                 logger.error(
+                logger.error(
                     "Grammar apply: logits_batch=%d grammar_batch=%s expected_reqs=%s actual_reqs=%s",
                     logits.shape[0],
                     len(grammar_output.grammar_bitmask)
