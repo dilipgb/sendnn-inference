@@ -1605,7 +1605,14 @@ class ChunkedPrefillModelRunner(
 
                     def __getattr__(self, name: str):
                         return getattr(self._batch, name)
-
+                
+                logger.warning(
+                    "[GRAMMAR_DEBUG] "
+                    f"grammar_bitmask_rows={grammar_output.grammar_bitmask.shape[0]} "
+                    f"batch_size={len(batch.req_ids)} "
+                    f"request_ids={grammar_output.request_ids} "
+                    f"num_bitmask_rows={grammar_output.num_bitmask_rows}"
+                    )
                 vllm_apply_grammar_bitmask(
                     scheduler_output,
                     grammar_output,
