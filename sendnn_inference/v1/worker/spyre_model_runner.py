@@ -1608,9 +1608,8 @@ class ChunkedPrefillModelRunner(
                 
                 logger.warning(
                     "[GRAMMAR_DEBUG] "
-                    f"grammar_bitmask_rows={grammar_output.grammar_bitmask.shape[0]} "
+                    f"grammar_output={grammar_output.grammar_bitmask.shape[0]} "
                     f"batch_size={len(batch.req_ids)} "
-                    f"num_bitmask_rows={grammar_output.num_bitmask_rows}"
                     )
                 vllm_apply_grammar_bitmask(
                     scheduler_output,
