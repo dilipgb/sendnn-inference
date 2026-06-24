@@ -1494,25 +1494,7 @@ class ChunkedPrefillModelRunner(
             # but we stored the OLD scheduler state (before removing finished requests).
             # We must clear the pending state and let the engine retry.
             if self._pending_sampling_state is not None:
-                logger.error(
-                    "[UPDATE_BATCH] Requests finished while grammar sampling was pending! "
-                    "Pending state exists: %s. "
-                    "Finished request IDs: %s. "
-                    "Stored batch req_ids: %s. "
-                    "Current batch req_ids: %s. "
-                    "Clearing pending state - engine will retry sampling.",
-                    self._pending_sampling_state is not None,
-                    scheduler_output.finished_req_ids,
-                    self._pending_sampling_state.batch_req_ids if self._pending_sampling_state else None,
-                    list(self.input_batch.sorted_requests_ids if hasattr(self.input_batch, "sorted_requests_ids") else self.input_batch.req_ids),
-                )
                 self.clear_pending_sampling()
-            
-            # Remove finished requests from the batch
-            logger.warning(
-                "[UPDATE_BATCH] Removing finished requests: %s",
-                scheduler_output.finished_req_ids,
-            )
             for req_id in scheduler_output.finished_req_ids:
                 self.input_batch.remove_request(req_id)
                 # Clean up request state to prevent memory leak
@@ -1613,13 +1595,6 @@ class ChunkedPrefillModelRunner(
                 # Reorder logits rows to match scheduler order
                 reorder_indices = [batch_to_scheduler_idx[req_id] for req_id in actual_reqs]
                 logits_reordered = logits[reorder_indices]
-                
-                logger.warning(
-                    "[GRAMMAR_DEBUG] "
-                    f"grammar_output={grammar_output.grammar_bitmask.shape[0]} "
-                    f"batch_size={len(expected_reqs)} "
-                    f"adapter_len={len(_SchedulerOrderedBatchAdapter(batch, expected_reqs))}"
-                    )
                 vllm_apply_grammar_bitmask(
                     scheduler_output,
                     grammar_output,
@@ -1715,16 +1690,6 @@ class ChunkedPrefillModelRunner(
             is_prefill=is_prefill,
             scheduler_output=scheduler_output_copy,  # Deep copied to prevent mutation/recycling
             batch_req_ids=batch_req_ids,  # Store request IDs to validate batch consistency
-        )
-
-        # Log debug message to help detect cleanup issues
-        logger.warning(
-            "[DEFER_SAMPLING] Deferred sampling for batch (is_prefill=%s, req_ids=%s, num_scheduled=%s). "
-            "Scheduler output has requests: %s",
-            is_prefill,
-            batch_req_ids,
-            list(scheduler_output.num_scheduled_tokens.keys()),
-            list(scheduler_output.num_scheduled_tokens.keys()),
         )
 
     def clear_pending_sampling(self) -> None:
@@ -1947,25 +1912,9 @@ class ChunkedPrefillModelRunner(
             else current_batch.req_ids
         )
         
-        logger.warning(
-            "[SAMPLE_TOKENS] Called with grammar_output batch_size=%s. "
-            "Stored batch: %s, current batch: %s. "
-            "Stored scheduler has: %s",
-            len(grammar_output.grammar_bitmask) if grammar_output else 0,
-            stored_batch_req_ids,
-            current_batch_req_ids,
-            list(stored_scheduler_output.num_scheduled_tokens.keys()),
-        )
-        
         # Validate batch consistency
         # Compare exact lists (not sets) to catch ordering issues
         if stored_batch_req_ids != current_batch_req_ids:
-            logger.error(
-                "[SAMPLE_TOKENS] Batch changed between defer_sampling() and sample_tokens(). "
-                "Stored batch: %s, current batch: %s. "
-                "This indicates requests finished/aborted while grammar was building.",
-                stored_batch_req_ids, current_batch_req_ids
-            )
             raise RuntimeError(
                 f"Batch mismatch in deferred sampling. "
                 f"Stored requests: {stored_batch_req_ids}, "
