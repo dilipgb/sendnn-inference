@@ -526,7 +526,7 @@ class SpyreWorker(WorkerBase):
         # "Multiple deferred sampling batches" error on next execute_model call
         # Only ChunkedPrefillModelRunner has this method (not SpyrePoolingModelRunner)
         if hasattr(self.model_runner, 'clear_pending_sampling'):
-            self.model_runner.clear_pending_sampling()
+            self.model_runner.clear_pending_sampling(reason="warmup_deploy")
         self._cleanup_model_runner(request=[deploy_req])
 
         model_runner.complete_warmup()
@@ -560,7 +560,7 @@ class SpyreWorker(WorkerBase):
         # This prevents "Multiple deferred sampling batches" error during warmup
         # Only ChunkedPrefillModelRunner has deferred sampling support
         if isinstance(self.model_runner, ChunkedPrefillModelRunner):
-            self.model_runner.clear_pending_sampling()
+            self.model_runner.clear_pending_sampling(reason="shutdown")
             # satisfy mypy
             self.model_runner.tkv = 0
 
@@ -704,7 +704,7 @@ class SpyreWorker(WorkerBase):
             # "Multiple deferred sampling batches" error on next execute_model call
             # Only ChunkedPrefillModelRunner has this method (not SpyrePoolingModelRunner)
             if hasattr(self.model_runner, 'clear_pending_sampling'):
-                self.model_runner.clear_pending_sampling()
+                self.model_runner.clear_pending_sampling(reason="warmup_prefill")
 
         random_token_id = lambda: torch.randint(0, len(valid_token_ids_tensor), (1,)).item()
 
@@ -735,7 +735,7 @@ class SpyreWorker(WorkerBase):
         # "Multiple deferred sampling batches" error on next execute_model call
         # Only ChunkedPrefillModelRunner has this method (not SpyrePoolingModelRunner)
         if hasattr(self.model_runner, 'clear_pending_sampling'):
-            self.model_runner.clear_pending_sampling()
+            self.model_runner.clear_pending_sampling(reason="warmup_decode")
         self._cleanup_model_runner(request=requests)
 
     def _warmup_model_forward_pass(
