@@ -1598,18 +1598,27 @@ class ChunkedPrefillModelRunner(
                 logits_reordered = logits[reorder_indices]
                 
                 # Apply grammar bitmask with scheduler-ordered batch adapter
+                # The adapter must properly expose the actual number of requests (not max capacity)
+                # and the request IDs in scheduler order for the grammar bitmask to work correctly
                 class _SchedulerOrderedBatchAdapter:
                     def __init__(self, batch: SamplingInputBatch, scheduler_req_ids: list[str]):
                         self._batch = batch
                         self.req_ids = scheduler_req_ids
+                        # Override sorted_requests_ids to match scheduler order
+                        self.sorted_requests_ids = scheduler_req_ids
 
                     def __getattr__(self, name: str):
                         return getattr(self._batch, name)
+                    
+                    def __len__(self) -> int:
+                        # Return actual number of requests, not max capacity
+                        return len(self.req_ids)
                 
                 logger.warning(
                     "[GRAMMAR_DEBUG] "
                     f"grammar_output={grammar_output.grammar_bitmask.shape[0]} "
-                    f"batch_size={len(batch.req_ids)} "
+                    f"batch_size={len(expected_reqs)} "
+                    f"adapter_len={len(_SchedulerOrderedBatchAdapter(batch, expected_reqs))}"
                     )
                 vllm_apply_grammar_bitmask(
                     scheduler_output,
