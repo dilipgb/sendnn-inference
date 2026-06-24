@@ -1580,6 +1580,23 @@ class ChunkedPrefillModelRunner(
             # vllm_apply_grammar_bitmask. If there's a mismatch (e.g., requests
             # finished/aborted while grammar was building), it will raise an error.
 
+            # Define adapter class to properly expose batch size and request ordering
+            # The adapter must properly expose the actual number of requests (not max capacity)
+            # and the request IDs in scheduler order for the grammar bitmask to work correctly
+            class _SchedulerOrderedBatchAdapter:
+                def __init__(self, batch: SamplingInputBatch, scheduler_req_ids: list[str]):
+                    self._batch = batch
+                    self.req_ids = scheduler_req_ids
+                    # Override sorted_requests_ids to match scheduler order
+                    self.sorted_requests_ids = scheduler_req_ids
+
+                def __getattr__(self, name: str):
+                    return getattr(self._batch, name)
+                
+                def __len__(self) -> int:
+                    # Return actual number of requests, not max capacity
+                    return len(self.req_ids)
+
             # If the request order differs between scheduler and batch, we need to
             # reorder logits to match the scheduler order (which the grammar bitmask expects)
             if expected_reqs != actual_reqs:
@@ -1596,23 +1613,6 @@ class ChunkedPrefillModelRunner(
                 # Reorder logits rows to match scheduler order
                 reorder_indices = [batch_to_scheduler_idx[req_id] for req_id in actual_reqs]
                 logits_reordered = logits[reorder_indices]
-                
-                # Apply grammar bitmask with scheduler-ordered batch adapter
-                # The adapter must properly expose the actual number of requests (not max capacity)
-                # and the request IDs in scheduler order for the grammar bitmask to work correctly
-                class _SchedulerOrderedBatchAdapter:
-                    def __init__(self, batch: SamplingInputBatch, scheduler_req_ids: list[str]):
-                        self._batch = batch
-                        self.req_ids = scheduler_req_ids
-                        # Override sorted_requests_ids to match scheduler order
-                        self.sorted_requests_ids = scheduler_req_ids
-
-                    def __getattr__(self, name: str):
-                        return getattr(self._batch, name)
-                    
-                    def __len__(self) -> int:
-                        # Return actual number of requests, not max capacity
-                        return len(self.req_ids)
                 
                 logger.warning(
                     "[GRAMMAR_DEBUG] "
@@ -1639,10 +1639,11 @@ class ChunkedPrefillModelRunner(
                     "Order: %s",
                     expected_reqs
                 )
+                # Still need to use adapter to expose correct batch size
                 vllm_apply_grammar_bitmask(
                     scheduler_output,
                     grammar_output,
-                    batch,  # type: ignore[arg-type]
+                    _SchedulerOrderedBatchAdapter(batch, expected_reqs),  # type: ignore[arg-type]
                     logits,
                 )
 
