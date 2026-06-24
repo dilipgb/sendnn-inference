@@ -551,9 +551,7 @@ class SpyreWorker(WorkerBase):
         # Clear pending sampling state after warmup execution to prevent
         # "Multiple deferred sampling batches" error on next execute_model call
         # Only ChunkedPrefillModelRunner has this method (not SpyrePoolingModelRunner)
-        if hasattr(self.model_runner, "clear_pending_sampling") and callable(
-            self.model_runner.clear_pending_sampling
-        ):
+        if hasattr(self.model_runner, "clear_pending_sampling"):
             self.model_runner.clear_pending_sampling(reason="warmup_deploy")  # type: ignore[attr-defined]
         self._cleanup_model_runner(request=[deploy_req])
 
