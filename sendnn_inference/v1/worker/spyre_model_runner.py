@@ -825,6 +825,9 @@ class ChunkedPrefillModelRunner(
 
     def complete_warmup(self) -> None:
         super().complete_warmup()
+        # Clear any pending sampling state from warmup
+        if self._pending_sampling_state is not None:
+            self.clear_pending_sampling(reason="warmup_complete")
         # get the number or pages from the actual Spyre card after the warmup
         # and set it accordingly in the model runner and for the kv cache size
         n_blocks_avail = SpyrePlatform.get_total_spyre_blocks(self.vllm_config)
