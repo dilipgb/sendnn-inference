@@ -114,6 +114,28 @@ class SamplingState:
     batch_req_ids: list[str]  # Store request IDs to validate batch consistency
 
 
+class SchedulerOrderedBatchAdapter:
+    """Adapter to expose batch with request ordering matching the scheduler.
+    
+    This adapter wraps a SamplingInputBatch and overrides the request ordering
+    to match the scheduler's order, which is required for grammar bitmask application.
+    The adapter also exposes the actual number of requests (not max capacity).
+    """
+
+    def __init__(self, batch: SamplingInputBatch, scheduler_req_ids: list[str]):
+        self._batch = batch
+        self.req_ids = scheduler_req_ids
+        # Override sorted_requests_ids to match scheduler order
+        self.sorted_requests_ids = scheduler_req_ids
+
+    def __getattr__(self, name: str):
+        return getattr(self._batch, name)
+    
+    def __len__(self) -> int:
+        # Return actual number of requests, not max capacity
+        return len(self.req_ids)
+
+
 InputBatchT = TypeVar("InputBatchT", bound=BaseInputBatch)
 ModelInputsT = TypeVar("ModelInputsT", bound=ModelForwardInputs)
 
@@ -718,6 +740,9 @@ class ChunkedPrefillModelRunner(
         self._enable_prefix_caching = vllm_config.cache_config.enable_prefix_caching
 
         # State for async sampling (when grammar bitmask is being built)
+        # Engine guarantees at most one outstanding deferred grammar batch per model runner.
+        # This assumes the execution pattern: forward(A) -> sample(A) -> forward(B) -> sample(B)
+        # and will not support: forward(A) -> forward(B) -> sample(A) -> sample(B)
         self._pending_sampling_state: SamplingState | None = None
 
         # TODO: Remove this once we can prefill and decode in the same step
@@ -1494,7 +1519,10 @@ class ChunkedPrefillModelRunner(
             # but we stored the OLD scheduler state (before removing finished requests).
             # We must clear the pending state and let the engine retry.
             if self._pending_sampling_state is not None:
-                self.clear_pending_sampling()
+                self.clear_pending_sampling(
+                    reason="requests_finished",
+                    finished_req_ids=scheduler_output.finished_req_ids,
+                )
             for req_id in scheduler_output.finished_req_ids:
                 self.input_batch.remove_request(req_id)
                 # Clean up request state to prevent memory leak
@@ -1549,6 +1577,14 @@ class ChunkedPrefillModelRunner(
             else batch.req_ids
         )
         
+        # Debug logging for grammar corruption diagnosis
+        logger.debug(
+            "Grammar bitmask application - Expected requests (scheduler): %s, "
+            "Actual requests (batch): %s",
+            expected_reqs,
+            actual_reqs,
+        )
+        
         # Verify that both lists contain the same requests (order may differ)
         if set(expected_reqs) != set(actual_reqs):
             raise RuntimeError(
@@ -1562,43 +1598,30 @@ class ChunkedPrefillModelRunner(
             # vllm_apply_grammar_bitmask. If there's a mismatch (e.g., requests
             # finished/aborted while grammar was building), it will raise an error.
 
-            # Define adapter class to properly expose batch size and request ordering
-            # The adapter must properly expose the actual number of requests (not max capacity)
-            # and the request IDs in scheduler order for the grammar bitmask to work correctly
-            class _SchedulerOrderedBatchAdapter:
-                def __init__(self, batch: SamplingInputBatch, scheduler_req_ids: list[str]):
-                    self._batch = batch
-                    self.req_ids = scheduler_req_ids
-                    # Override sorted_requests_ids to match scheduler order
-                    self.sorted_requests_ids = scheduler_req_ids
-
-                def __getattr__(self, name: str):
-                    return getattr(self._batch, name)
-                
-                def __len__(self) -> int:
-                    # Return actual number of requests, not max capacity
-                    return len(self.req_ids)
-
             # If the request order differs between scheduler and batch, we need to
             # reorder logits to match the scheduler order (which the grammar bitmask expects)
             if expected_reqs != actual_reqs:
-                logger.debug(
-                    "Request ordering mismatch detected. Reordering logits. "
+                # WARNING: This path exercises request reordering logic.
+                # If you see this, verify the reordering is working correctly.
+                logger.warning(
+                    "ORDER MISMATCH path exercised - Request ordering differs between scheduler and batch. "
                     "Scheduler order: %s, Batch order: %s",
                     expected_reqs, actual_reqs
                 )
                 # Create a mapping from batch order to scheduler order
+                # For each request in batch order, find its position in scheduler order
                 batch_to_scheduler_idx = {
                     req_id: expected_reqs.index(req_id)
                     for req_id in actual_reqs
                 }
                 # Reorder logits rows to match scheduler order
+                # reorder_indices[i] tells us which scheduler position batch position i should map to
                 reorder_indices = [batch_to_scheduler_idx[req_id] for req_id in actual_reqs]
                 logits_reordered = logits[reorder_indices]
                 vllm_apply_grammar_bitmask(
                     scheduler_output,
                     grammar_output,
-                    _SchedulerOrderedBatchAdapter(batch, expected_reqs),  # type: ignore[arg-type]
+                    SchedulerOrderedBatchAdapter(batch, expected_reqs),  # type: ignore[arg-type]
                     logits_reordered,
                 )
                 
@@ -1618,7 +1641,7 @@ class ChunkedPrefillModelRunner(
                 vllm_apply_grammar_bitmask(
                     scheduler_output,
                     grammar_output,
-                    _SchedulerOrderedBatchAdapter(batch, expected_reqs),  # type: ignore[arg-type]
+                    SchedulerOrderedBatchAdapter(batch, expected_reqs),  # type: ignore[arg-type]
                     logits,
                 )
 
@@ -1647,32 +1670,16 @@ class ChunkedPrefillModelRunner(
         # refresh_metadata() on every scheduler step. If we store by reference,
         # when sample_tokens() executes, it will use metadata from a different
         # batch, causing wrong sampling (wrong request, wrong temperature, wrong RNG).
-        try:
-            metadata = copy.deepcopy(self.get_sampling_metadata(is_prefill))
-        except Exception as e:
-            logger.error(
-                "Failed to deep copy SamplingMetadata. This may cause correctness issues "
-                "if metadata is mutated before sample_tokens() is called. Error: %s",
-                e,
-            )
-            # Fall back to reference (risky but allows execution to continue)
-            metadata = self.get_sampling_metadata(is_prefill)
+        # Deep copy is REQUIRED for correctness - let it fail if it doesn't work.
+        metadata = copy.deepcopy(self.get_sampling_metadata(is_prefill))
 
         # Deep copy scheduler_output to prevent mutation issues
         # Many schedulers recycle objects for performance. If scheduler mutates
         # this object later, stored_scheduler_output may no longer represent the
         # batch that produced the logits. This can cause: wrong req_ids, wrong
         # grammar mapping, wrong logprob routing.
-        try:
-            scheduler_output_copy = copy.deepcopy(scheduler_output)
-        except Exception as e:
-            logger.error(
-                "Failed to deep copy SchedulerOutput. This may cause correctness issues "
-                "if scheduler_output is mutated before sample_tokens() is called. Error: %s",
-                e,
-            )
-            # Fall back to reference (risky but allows execution to continue)
-            scheduler_output_copy = scheduler_output
+        # Deep copy is REQUIRED for correctness - let it fail if it doesn't work.
+        scheduler_output_copy = copy.deepcopy(scheduler_output)
 
         # Store the current batch request IDs to validate consistency when applying grammar
         # The batch object itself is mutable and gets modified (requests added/removed),
@@ -1685,25 +1692,39 @@ class ChunkedPrefillModelRunner(
         )
 
         self._pending_sampling_state = SamplingState(
-            logits=logits.clone(),  # Clone to prevent reuse bugs (expensive but necessary)
+            # Clone required because logits storage may be reused before deferred sampling completes.
+            # This is expensive (batch_size × vocab_size) but necessary for correctness.
+            logits=logits.clone(),
             metadata=metadata,  # Deep copied to prevent mutation
             is_prefill=is_prefill,
             scheduler_output=scheduler_output_copy,  # Deep copied to prevent mutation/recycling
             batch_req_ids=batch_req_ids,  # Store request IDs to validate batch consistency
         )
 
-    def clear_pending_sampling(self) -> None:
+    def clear_pending_sampling(
+        self,
+        reason: str = "unknown",
+        finished_req_ids: list[str] | None = None,
+    ) -> None:
         """Clear any pending sampling state.
 
         This should be called on error paths or when aborting deferred sampling
         to prevent memory leaks.
 
+        Args:
+            reason: Why the pending state is being cleared (for debugging).
+            finished_req_ids: Request IDs that finished, if applicable.
         """
         if self._pending_sampling_state is not None:
+            stored_batch_req_ids = self._pending_sampling_state.batch_req_ids
             logger.warning(
                 "Clearing pending sampling state without sample_tokens() being called. "
+                "Reason: %s. Finished requests: %s. Stored batch requests: %s. "
                 "This may indicate a request cancellation, grammar build failure, or shutdown. "
-                "Leaked state: logits (GPU memory), metadata, scheduler_output."
+                "Leaked state: logits (GPU memory), metadata, scheduler_output.",
+                reason,
+                finished_req_ids,
+                stored_batch_req_ids,
             )
         self._pending_sampling_state = None
 
@@ -1915,10 +1936,12 @@ class ChunkedPrefillModelRunner(
         # Validate batch consistency
         # Compare exact lists (not sets) to catch ordering issues
         if stored_batch_req_ids != current_batch_req_ids:
+            stored_scheduler_req_ids = list(stored_scheduler_output.num_scheduled_tokens.keys())
             raise RuntimeError(
                 f"Batch mismatch in deferred sampling. "
-                f"Stored requests: {stored_batch_req_ids}, "
-                f"Current requests: {current_batch_req_ids}"
+                f"Stored batch requests: {stored_batch_req_ids}, "
+                f"Current batch requests: {current_batch_req_ids}, "
+                f"Stored scheduler requests: {stored_scheduler_req_ids}"
             )
 
         # Apply constraints using the current batch (which we've validated matches)
