@@ -1517,10 +1517,6 @@ class ChunkedPrefillModelRunner(
             req_state.num_computed_tokens = num_computed_tokens
 
         if scheduler_output.finished_req_ids:
-            # If there's pending sampling, we have a problem:
-            # The grammar output will be built for the NEW scheduler state (after removing finished requests)
-            # but we stored the OLD scheduler state (before removing finished requests).
-            # We must clear the pending state and let the engine retry.
             if self._pending_sampling_state is not None:
                 self.clear_pending_sampling(
                     reason="requests_finished",
@@ -1670,7 +1666,7 @@ class ChunkedPrefillModelRunner(
         # refresh_metadata() on every scheduler step. If we store by reference,
         # when sample_tokens() executes, it will use metadata from a different
         # batch, causing wrong sampling (wrong request, wrong temperature, wrong RNG).
-        # Deep copy is REQUIRED for correctness - let it fail if it doesn't work.
+        # Deep copy is REQUIRED for correctness
         metadata = copy.deepcopy(self.get_sampling_metadata(is_prefill))
 
         # Deep copy scheduler_output to prevent mutation issues
@@ -1678,7 +1674,7 @@ class ChunkedPrefillModelRunner(
         # this object later, stored_scheduler_output may no longer represent the
         # batch that produced the logits. This can cause: wrong req_ids, wrong
         # grammar mapping, wrong logprob routing.
-        # Deep copy is REQUIRED for correctness - let it fail if it doesn't work.
+        # Deep copy is REQUIRED for correctness.
         scheduler_output_copy = copy.deepcopy(scheduler_output)
 
         # Store the current batch request IDs to validate consistency when applying grammar
@@ -1698,8 +1694,8 @@ class ChunkedPrefillModelRunner(
             metadata=metadata,  # Deep copied to prevent mutation
             is_prefill=is_prefill,
             scheduler_output=scheduler_output_copy,  # Deep copied to prevent mutation/recycling
-            batch_req_ids=batch_req_ids,  # Store request IDs to validate batch consistency
-        )
+            batch_req_ids=batch_req_ids, 
+            )
 
     def clear_pending_sampling(
         self,
@@ -1727,27 +1723,6 @@ class ChunkedPrefillModelRunner(
                 stored_batch_req_ids,
             )
         self._pending_sampling_state = None
-
-    def apply_constraints(
-        self,
-        scheduler_output: "SchedulerOutput",
-        grammar_output: "GrammarOutput | None",
-        logits: torch.Tensor,
-        is_prefill: bool,
-        batch: "SamplingInputBatch | None" = None,
-    ) -> None:
-        """Apply grammar constraints to logits.
-        
-        Args:
-            scheduler_output: The scheduler output for this batch.
-            grammar_output: The grammar output with bitmasks to apply.
-            logits: The logits tensor to modify.
-            is_prefill: Whether this is a prefill batch.
-            batch: The batch to use. If None, uses current batch from self.
-        """
-        if batch is None:
-            batch = self.prefill_batch if is_prefill else self.input_batch
-        self.apply_grammar_bitmask(scheduler_output, grammar_output, logits, batch)
 
     def perform_sampling(
         self,
@@ -1944,9 +1919,9 @@ class ChunkedPrefillModelRunner(
                 f"Stored scheduler requests: {stored_scheduler_req_ids}"
             )
 
-        # Apply constraints using the current batch (which we've validated matches)
-        self.apply_constraints(
-            stored_scheduler_output, grammar_output, logits, is_prefill, batch=current_batch
+        # Apply grammar bitmask constraints to logits
+        self.apply_grammar_bitmask(
+            stored_scheduler_output, grammar_output, logits, current_batch
         )
 
         # Perform sampling and build output
