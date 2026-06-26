@@ -1756,11 +1756,13 @@ class ChunkedPrefillModelRunner(
                     actual_reqs,
                 )
 
-                batch_to_scheduler_idx = {
-                    req_id: expected_reqs.index(req_id) for req_id in actual_reqs
-                }
-
-                reorder_indices = [batch_to_scheduler_idx[req_id] for req_id in actual_reqs]
+                # Build gather indices: for each position in scheduler order,
+                # find the corresponding row in the logits tensor (which is
+                # in batch/slot order).  logits_reordered[sched_i] will then
+                # hold the logits for the request at scheduler position sched_i,
+                # which is exactly what vllm_apply_grammar_bitmask expects.
+                batch_req_to_idx = {req_id: i for i, req_id in enumerate(actual_reqs)}
+                reorder_indices = [batch_req_to_idx[req_id] for req_id in expected_reqs]
                 logits_reordered = logits[reorder_indices]
 
                 vllm_apply_grammar_bitmask(
@@ -1770,9 +1772,11 @@ class ChunkedPrefillModelRunner(
                     logits_reordered,
                 )
 
+                # Scatter modified logits back into the original batch-order
+                # tensor.  inverse[batch_i] = sched_i undoes the gather above.
                 inverse_reorder_indices = [0] * len(reorder_indices)
-                for batch_idx, scheduler_idx in enumerate(reorder_indices):
-                    inverse_reorder_indices[scheduler_idx] = batch_idx
+                for sched_idx, batch_idx in enumerate(reorder_indices):
+                    inverse_reorder_indices[batch_idx] = sched_idx
                 logits[:] = logits_reordered[inverse_reorder_indices]
             else:
                 logger.debug("Request ordering matches. Order: %s", expected_reqs)
