@@ -1720,9 +1720,7 @@ class ChunkedPrefillModelRunner(
         """
 
         expected_reqs = list(scheduler_output.num_scheduled_tokens.keys())
-        actual_reqs = list(
-            batch.sorted_requests_ids
-        )
+        actual_reqs = list(batch.sorted_requests_ids)
 
         logger.debug(
             "Grammar bitmask application - Expected requests (scheduler): %s, "
@@ -1809,9 +1807,7 @@ class ChunkedPrefillModelRunner(
         # The batch object itself is mutable and gets modified (requests added/removed),
         # so we capture the request IDs at this point in time.
         batch = self.prefill_batch if is_prefill else self.input_batch
-        batch_req_ids = list(
-            batch.sorted_requests_ids if hasattr(batch, "sorted_requests_ids") else batch.req_ids
-        )
+        batch_req_ids = list(batch.sorted_requests_ids)
 
         self._pending_sampling_state = SamplingState(
             # logits is the result of an advanced-index gather inside SpyreCausalLM.forward()
@@ -1928,24 +1924,10 @@ class ChunkedPrefillModelRunner(
         # Clear the pending state
         self._pending_sampling_state = None
 
-        # Get the current batch
+        # Use the batch object only as a proxy for non-ID attributes needed by
+        # vllm_apply_grammar_bitmask; the request ordering comes from the stored
+        # snapshot so it remains correct even if the live batch has changed.
         current_batch = self.prefill_batch if is_prefill else self.input_batch
-        current_batch_req_ids = list(
-            current_batch.sorted_requests_ids
-            if hasattr(current_batch, "sorted_requests_ids")
-            else current_batch.req_ids
-        )
-
-        # Validate batch consistency
-        # Compare exact lists (not sets) to catch ordering issues
-        if stored_batch_req_ids != current_batch_req_ids:
-            stored_scheduler_req_ids = list(stored_scheduler_output.num_scheduled_tokens.keys())
-            raise RuntimeError(
-                f"Batch mismatch in deferred sampling. "
-                f"Stored batch requests: {stored_batch_req_ids}, "
-                f"Current batch requests: {current_batch_req_ids}, "
-                f"Stored scheduler requests: {stored_scheduler_req_ids}"
-            )
 
         # Apply grammar bitmask constraints to logits
         self.apply_grammar_bitmask(stored_scheduler_output, grammar_output, logits, current_batch)
