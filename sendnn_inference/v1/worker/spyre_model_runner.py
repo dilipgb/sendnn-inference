@@ -127,25 +127,23 @@ class SamplingState:
 
 
 class SchedulerOrderedBatchAdapter:
-    """Adapter to expose batch with request ordering matching the scheduler.
+    """Adapter that overrides req_ids ordering on a SamplingInputBatch.
 
-    This adapter wraps a SamplingInputBatch and overrides the request ordering
-    to match the scheduler's order, which is required for grammar bitmask application.
-    The adapter also exposes the actual number of requests (not max capacity).
+    vllm_apply_grammar_bitmask iterates input_batch.req_ids to map each
+    request to its logit row index.  Our logits tensor is reordered into
+    scheduler order before the call, so req_ids must reflect that same
+    order.  This adapter shadows req_ids (and sorted_requests_ids, which
+    our own code reads) with the scheduler-ordered list while delegating
+    everything else to the real batch.
     """
 
     def __init__(self, batch: SamplingInputBatch, scheduler_req_ids: list[str]):
         self._batch = batch
         self.req_ids = scheduler_req_ids
-        # Override sorted_requests_ids to match scheduler order
         self.sorted_requests_ids = scheduler_req_ids
 
     def __getattr__(self, name: str):
         return getattr(self._batch, name)
-
-    def __len__(self) -> int:
-        # Return actual number of requests, not max capacity
-        return len(self.req_ids)
 
 
 InputBatchT = TypeVar("InputBatchT", bound=BaseInputBatch)
@@ -263,6 +261,17 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
     def complete_warmup(self):
         """Turn off warmup mode once the warmup is complete"""
         self.warmup_mode = False
+
+    def clear_pending_sampling(
+        self,
+        reason: str = "unknown",
+        finished_req_ids: list[str] | None = None,
+    ) -> None:
+        """Clear any deferred sampling state before it is consumed.
+
+        The pooling runner never defers sampling, so this is a no-op here.
+        ChunkedPrefillModelRunner overrides this with the real implementation.
+        """
 
     def build_attn_metadata(self, model_input: ModelInputsT) -> SpyreAttentionMetadata:
         # TODO: probably sooner we will need a more sophisticated way to switch
@@ -1379,12 +1388,13 @@ class ChunkedPrefillModelRunner(
             slot_mapping.append(slot)
 
             # input token and position of the token generated in the last step
-            # During warmup or first decode step, output_token_ids may be empty,
-            # so use new_token_ids from cached_request_data
+            # During warmup the prefill's sample_tokens() is skipped
+            # (clear_pending_sampling discards it), so output_token_ids is never
+            # populated.  Fall back to the token supplied by the warmup harness
+            # via cached_request_data.new_token_ids.
             if req_state.output_token_ids:
                 generation_token = req_state.output_token_ids[-1]
             else:
-                # Use the new token from cached_request_data (e.g., during warmup)
                 generation_token = cached_request_data.new_token_ids[idx][0]
             input_tokens.append([generation_token])
             input_positions.append([req_state.num_computed_tokens])
@@ -1524,8 +1534,6 @@ class ChunkedPrefillModelRunner(
         else:
             generator = None
 
-        structured_output_request = getattr(request, "structured_output_request", None)
-
         req_state = SamplingRequestState(
             generator=generator,
             req_id=req_id,
@@ -1538,7 +1546,6 @@ class ChunkedPrefillModelRunner(
             usable_blocks=chunk_plan.usable_cache_blocks,
             total_hit_blocks=chunk_plan.total_cache_blocks,
             block_ids=request.block_ids[0],  # we only support on kv cache group for now
-            structured_output_request=structured_output_request,
         )
 
         self.requests[req_id] = req_state
@@ -1819,9 +1826,10 @@ class ChunkedPrefillModelRunner(
         )
 
         self._pending_sampling_state = SamplingState(
-            # logits.clone() is needed: the underlying tensor may be a view into
-            # model output buffers that get overwritten on the next forward pass.
-            logits=logits.clone(),
+            # logits is the result of an advanced-index gather inside SpyreCausalLM.forward()
+            # (logits[self.indices, -1, :]), which always produces a fresh tensor with its
+            # own storage — never a view into model output buffers. No clone needed.
+            logits=logits,
             metadata=self.get_sampling_metadata(is_prefill),
             is_prefill=is_prefill,
             scheduler_output=scheduler_output,
@@ -1844,11 +1852,9 @@ class ChunkedPrefillModelRunner(
         """
         if self._pending_sampling_state is not None:
             stored_batch_req_ids = self._pending_sampling_state.batch_req_ids
-            logger.warning(
+            logger.debug(
                 "Clearing pending sampling state without sample_tokens() being called. "
-                "Reason: %s. Finished requests: %s. Stored batch requests: %s. "
-                "This may indicate a request cancellation, grammar build failure, or shutdown. "
-                "Leaked state: logits (GPU memory), metadata, scheduler_output.",
+                "Reason: %s. Finished requests: %s. Stored batch requests: %s.",
                 reason,
                 finished_req_ids,
                 stored_batch_req_ids,
@@ -2005,13 +2011,6 @@ class ChunkedPrefillModelRunner(
         Returns:
             ModelRunnerOutput for driver worker, None for non-driver workers.
         """
-        # Verify pending state exists
-        assert self._pending_sampling_state is not None, (
-            "sample_tokens() called but no pending sampling state exists. "
-            "This indicates sample_tokens() was called without prior defer_sampling(), "
-            "or the state was already cleared."
-        )
-
         state = self._pending_sampling_state
         logits = state.logits
         sampling_metadata = state.metadata
@@ -2056,7 +2055,9 @@ class ChunkedPrefillModelRunner(
         # next decode step so the full batch isn't routed through a single slot.
         if is_prefill:
             for logitsproc in self.input_batch.logitsprocs_wrappers:
-                logitsproc.set_prefill_index(None)
+                # apply() already self-clears _prefill_index after use; this is
+                # a belt-and-suspenders reset in case sampling was skipped.
+                logitsproc._prefill_index = None
 
         return result
 
