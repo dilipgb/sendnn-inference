@@ -87,9 +87,9 @@ class TestSchedulerStructuredOutputHandling:
     """Test that the scheduler preserves structured_output_request on requests."""
 
     def test_scheduler_preserves_structured_output_request(self, mocked_scheduler):
-        """Test that the scheduler preserves structured_output_request on requests."""
+        """A grammar-pending request must stay WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+        after schedule() — the scheduler must not promote it prematurely."""
 
-        # Create a request with structured outputs
         sampling_params = SamplingParams(
             max_tokens=20,
             temperature=0.0,
@@ -105,17 +105,17 @@ class TestSchedulerStructuredOutputHandling:
             pooling_params=None,
         )
 
-        # Verify structured_output_request is set
         assert request.structured_output_request is not None
         assert request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
 
-        # Add request to waiting queue
         mocked_scheduler.waiting.append(request)
-        # Call the actual schedule method
         mocked_scheduler.schedule()
 
-        # Verify structured_output_request is preserved
+        # Grammar is still None, so the request must remain blocked.
         assert request.structured_output_request is not None
+        assert request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
+            "Scheduler prematurely promoted a grammar-pending request to WAITING"
+        )
 
     def test_scheduler_handles_request_without_structured_output(self, mocked_scheduler):
         """Test that requests without structured_output_request are unaffected."""
@@ -148,9 +148,8 @@ class TestSchedulerStructuredOutputHandling:
         # Status may have changed due to base scheduler, but that's OK
 
     def test_scheduler_handles_multiple_requests_with_structured_outputs(self, mocked_scheduler):
-        """Test that multiple requests with structured outputs are all preserved."""
+        """Multiple grammar-pending requests must all stay blocked after schedule()."""
 
-        # Create multiple requests with structured outputs
         requests = []
         for i in range(3):
             sampling_params = SamplingParams(
@@ -170,17 +169,18 @@ class TestSchedulerStructuredOutputHandling:
             requests.append(request)
             mocked_scheduler.waiting.append(request)
 
-        # Verify all have structured_output_request set
         for request in requests:
             assert request.structured_output_request is not None
             assert request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
 
-        # Call the actual schedule method
         mocked_scheduler.schedule()
 
-        # Verify all are preserved
+        # Grammar is still None for all — all must remain blocked.
         for request in requests:
             assert request.structured_output_request is not None
+            assert request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
+                f"Request {request.request_id} was prematurely promoted to WAITING"
+            )
 
     def test_scheduler_preserves_other_request_attributes(self, mocked_scheduler):
         """Test that other request attributes are not affected by scheduling."""
@@ -226,8 +226,8 @@ class TestSchedulerSimultaneousRequests:
     """Test that the scheduler handles simultaneous structured and regular requests."""
 
     def test_simultaneous_structured_and_regular_requests(self, mocked_scheduler):
-        """Simulate a mixed batch: some requests use json_object, others don't.
-        All structured_output_request values should be preserved correctly."""
+        """Mixed batch: grammar-pending structured requests must stay blocked;
+        the regular request (no grammar) must be schedulable (WAITING)."""
 
         structured_params = SamplingParams(
             max_tokens=20,
@@ -264,27 +264,33 @@ class TestSchedulerSimultaneousRequests:
             pooling_params=None,
         )
 
-        # Verify initial state
         assert structured_req_1.structured_output_request is not None
         assert regular_req.structured_output_request is None
         assert structured_req_2.structured_output_request is not None
 
-        # Add all three to the waiting queue simultaneously
         mocked_scheduler.waiting.append(structured_req_1)
         mocked_scheduler.waiting.append(regular_req)
         mocked_scheduler.waiting.append(structured_req_2)
 
         mocked_scheduler.schedule()
 
-        # Structured requests should still have their structured_output_request
-        assert structured_req_1.structured_output_request is not None
-        assert structured_req_2.structured_output_request is not None
-        # Regular request should still have None
+        # Grammar still None — structured requests must remain blocked.
+        assert structured_req_1.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
+            "struct_1 was prematurely promoted despite grammar not being ready"
+        )
+        assert structured_req_2.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
+            "struct_2 was prematurely promoted despite grammar not being ready"
+        )
+        # Regular request has no grammar constraint — must not be blocked.
+        assert regular_req.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
+            "regular_req was incorrectly put into WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR"
+        )
         assert regular_req.structured_output_request is None
 
     def test_simultaneous_structured_requests_all_preserved(self, mocked_scheduler):
-        """Multiple structured output requests arriving at the same time
-        should all be preserved after scheduling."""
+        """Multiple grammar-pending structured requests arriving simultaneously
+        must all remain blocked (WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR) after
+        schedule() — none should be prematurely promoted."""
 
         requests = []
         for i in range(4):
@@ -309,6 +315,10 @@ class TestSchedulerSimultaneousRequests:
         for req in requests:
             assert req.structured_output_request is not None, (
                 f"Request {req.request_id} lost its structured_output_request"
+            )
+            assert req.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
+                f"Request {req.request_id} was prematurely promoted to WAITING "
+                "despite its grammar not being ready"
             )
 
     def test_grammar_ready_request_promoted_to_waiting(self, mocked_scheduler):
