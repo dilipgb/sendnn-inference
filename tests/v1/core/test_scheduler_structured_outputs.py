@@ -1,8 +1,9 @@
 """Unit tests for scheduler handling of structured outputs.
 
 Tests the structured output support in sendnn_inference/v1/core/scheduler.py that
-preserves structured_output_request on Request objects and attaches grammar
-output via _spyre_grammar_output attribute in the chunked prefill scheduler.
+preserves structured_output_request on Request objects and promotes the grammar
+status (WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR → WAITING) when a grammar becomes
+ready during schedule().
 
 These unit tests mock the scheduler dependencies and call the actual schedule() method.
 """
@@ -13,7 +14,7 @@ from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.core.sched.output import CachedRequestData
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from sendnn_inference.v1.core.scheduler import ChunkedPrefillSpyreScheduler
 from scheduling_utils import create_request_for_scheduler_test, random_prompt
 
@@ -70,19 +71,14 @@ def mocked_scheduler():
     scheduler.kv_cache_manager = Mock()
     scheduler.kv_cache_manager.get_computed_blocks.return_value = (None, 0)
 
-    # Mock the base scheduler's schedule method and can_schedule_prefill,
-    # but ChunkedPrefillSpyreScheduler.schedule uses the code implementation
-    mock_output = Mock()
-    mock_output.has_structured_output_requests = False
-    mock_output.num_scheduled_tokens = {}
-    mock_output.scheduled_new_reqs = []
-    mock_output.scheduled_cached_reqs = CachedRequestData.make_empty()
-    # mock_output.total_num_scheduled_tokens = 0
-    # mock_output.finished_req_ids = set()
+    # Use a real SchedulerOutput (not Mock) so that hasattr checks and attribute
+    # accesses behave exactly as they would in production.  A raw Mock() silently
+    # returns truthy values for every attribute lookup, masking missing assignments.
+    real_output = SchedulerOutput.make_empty()
 
     with (
         patch.object(ChunkedPrefillSpyreScheduler, "can_schedule_prefill", return_value=True),
-        patch("vllm.v1.core.sched.scheduler.Scheduler.schedule", return_value=mock_output),
+        patch("vllm.v1.core.sched.scheduler.Scheduler.schedule", return_value=real_output),
     ):
         yield scheduler
 
@@ -315,71 +311,125 @@ class TestSchedulerSimultaneousRequests:
                 f"Request {req.request_id} lost its structured_output_request"
             )
 
-    def test_grammar_output_attached_for_mixed_batch(self, mocked_scheduler):
-        """Verify _spyre_grammar_output is attached to scheduler output
-        when the batch contains a mix of structured and regular requests."""
+    def test_grammar_ready_request_promoted_to_waiting(self, mocked_scheduler):
+        """A structured-output request whose grammar becomes ready between
+        schedule() calls must be promoted from
+        WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR → WAITING so the scheduler
+        can prefill it.
 
-        structured_params = SamplingParams(
+        Regression: if the promotion loop (scheduler.py lines 414-418) were
+        removed, the request would stay blocked on grammar indefinitely even
+        after the grammar compiled.
+        """
+        sampling_params = SamplingParams(
             max_tokens=20,
             temperature=0.0,
             structured_outputs=StructuredOutputsParams(json_object=True),
         )
-        regular_params = SamplingParams(
+        request = Request(
+            request_id="struct_req",
+            sampling_params=sampling_params,
+            prompt_token_ids=list(range(50)),
+            arrival_time=0,
+            lora_request=None,
+            pooling_params=None,
+        )
+
+        # Before grammar is ready the request is blocked.
+        assert request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+        assert request.structured_output_request is not None
+        assert request.structured_output_request.grammar is None
+
+        # Simulate grammar becoming ready by injecting a truthy grammar object.
+        request.structured_output_request.grammar = Mock()
+
+        mocked_scheduler.waiting.append(request)
+        mocked_scheduler.schedule()
+
+        # After schedule(), the request must have been promoted to WAITING.
+        assert request.status == RequestStatus.WAITING, (
+            "Request with a ready grammar was not promoted from "
+            "WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR to WAITING"
+        )
+
+    def test_grammar_not_ready_request_stays_blocked(self, mocked_scheduler):
+        """A structured-output request whose grammar is still compiling must
+        NOT be promoted — it must remain WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+        so it is excluded from the prefill candidates.
+
+        Regression: premature promotion would attempt to prefill a request
+        before its grammar bitmask is available.
+        """
+        sampling_params = SamplingParams(
             max_tokens=20,
             temperature=0.0,
+            structured_outputs=StructuredOutputsParams(json_object=True),
+        )
+        request = Request(
+            request_id="struct_req_pending",
+            sampling_params=sampling_params,
+            prompt_token_ids=list(range(50)),
+            arrival_time=0,
+            lora_request=None,
+            pooling_params=None,
         )
 
-        mocked_scheduler.waiting.append(
-            Request(
-                request_id="struct_req",
-                sampling_params=structured_params,
-                prompt_token_ids=list(range(50)),
-                arrival_time=0,
-                lora_request=None,
-                pooling_params=None,
-            )
-        )
-        mocked_scheduler.waiting.append(
-            Request(
-                request_id="regular_req",
-                sampling_params=regular_params,
-                prompt_token_ids=list(range(40)),
-                arrival_time=1,
-                lora_request=None,
-                pooling_params=None,
-            )
+        # Grammar is still None (compiling).
+        assert request.structured_output_request is not None
+        assert request.structured_output_request.grammar is None
+
+        mocked_scheduler.waiting.append(request)
+        mocked_scheduler.schedule()
+
+        # Status must stay blocked — grammar is not ready.
+        assert request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
+            "Request was prematurely promoted while its grammar was still compiling"
         )
 
-        output = mocked_scheduler.schedule()
+    def test_mixed_batch_only_ready_grammar_requests_promoted(self, mocked_scheduler):
+        """In a mixed waiting queue, only requests with a ready grammar are
+        promoted to WAITING; the rest stay blocked.
 
-        # _spyre_grammar_output should be set on the output
-        assert hasattr(output, "_spyre_grammar_output")
-
-    def test_grammar_output_attached_for_all_regular_batch(self, mocked_scheduler):
-        """When all requests are regular (no structured output),
-        _spyre_grammar_output should still be set (may be None)."""
-
-        regular_params = SamplingParams(
+        Regression: a bulk-promote bug could flip all requests to WAITING
+        regardless of whether their grammar compiled.
+        """
+        sampling_params = SamplingParams(
             max_tokens=20,
             temperature=0.0,
+            structured_outputs=StructuredOutputsParams(json_object=True),
         )
 
-        for i in range(3):
-            mocked_scheduler.waiting.append(
-                Request(
-                    request_id=f"regular_{i}",
-                    sampling_params=regular_params,
-                    prompt_token_ids=list(range(50)),
-                    arrival_time=i,
-                    lora_request=None,
-                    pooling_params=None,
-                )
-            )
+        ready_req = Request(
+            request_id="ready",
+            sampling_params=sampling_params,
+            prompt_token_ids=list(range(30)),
+            arrival_time=0,
+            lora_request=None,
+            pooling_params=None,
+        )
+        pending_req = Request(
+            request_id="pending",
+            sampling_params=sampling_params,
+            prompt_token_ids=list(range(30)),
+            arrival_time=1,
+            lora_request=None,
+            pooling_params=None,
+        )
 
-        output = mocked_scheduler.schedule()
+        # Only ready_req has its grammar compiled.
+        assert ready_req.structured_output_request is not None
+        ready_req.structured_output_request.grammar = Mock()
 
-        # _spyre_grammar_output should still be attached (even if None)
-        assert hasattr(output, "_spyre_grammar_output")
+        mocked_scheduler.waiting.append(ready_req)
+        mocked_scheduler.waiting.append(pending_req)
+        mocked_scheduler.schedule()
+
+        assert ready_req.status == RequestStatus.WAITING, (
+            "ready_req with compiled grammar was not promoted to WAITING"
+        )
+        assert pending_req.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
+            "pending_req was promoted despite its grammar not being ready"
+        )
 
 
 def test_sparse_index_grammar_crash(
