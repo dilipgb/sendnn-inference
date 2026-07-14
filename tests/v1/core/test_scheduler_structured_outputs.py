@@ -190,26 +190,24 @@ def test_grammar_not_ready_request_stays_blocked(mocked_scheduler):
 
 def test_regular_request_not_blocked_alongside_pending_grammar(mocked_scheduler):
     """A regular (non-structured-output) request in the same waiting queue as
-    a grammar-pending request must not be incorrectly blocked.
+    a grammar-pending request must be picked up for prefill (step_is_prefill=True).
 
-    Regression: if the scheduler confused request types it could put a plain
-    request into WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR.
+    Regression: an inverted ready_to_prefill filter would exclude the regular
+    request from the prefill candidates, leaving it stuck behind the grammar-
+    pending one with step_is_prefill=False.
     """
     structured_req = _make_structured_request("struct", arrival_time=0)
     regular_req = _make_regular_request("regular", arrival_time=1)
-
-    assert structured_req.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
-    assert regular_req.status == RequestStatus.WAITING
 
     mocked_scheduler.waiting.append(structured_req)
     mocked_scheduler.waiting.append(regular_req)
     mocked_scheduler.schedule()
 
-    assert structured_req.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
-        "structured_req was prematurely promoted despite grammar not being ready"
-    )
-    assert regular_req.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, (
-        "regular_req was incorrectly put into WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR"
+    # The regular request has no grammar constraint, so the scheduler must
+    # have selected it for prefill — step_is_prefill must be True.
+    assert mocked_scheduler.step_is_prefill is True, (
+        "Scheduler failed to schedule the regular request for prefill; "
+        "the ready_to_prefill filter likely excluded it incorrectly"
     )
 
 
@@ -224,6 +222,16 @@ def test_sparse_index_grammar_crash(
     """Schedule two structured-output requests so that the first finishes
     earlier, creating a hole in the sparse bitmask index.  This reproduces a
     crash that occurred when the sparse index was non-contiguous.
+
+    request1 finishes after 3 decode steps, leaving slot 0 empty while
+    request2 is still decoding in slot 1.  With the bug (returning the padded
+    slot index instead of the dense output index), the sampled token for
+    request2 gets attributed to the wrong position and either:
+      - raises an IndexError (dense output has 1 row, index 1 is out of bounds), or
+      - silently assigns the token to the wrong request ID.
+
+    We assert that request2 receives exactly max_tokens=4 output tokens —
+    confirming tokens were correctly routed to it after the hole appeared.
     """
     pc_model_runner = InstrumentedModelRunner.build(
         monkeypatch=monkeypatch,
@@ -272,9 +280,26 @@ def test_sparse_index_grammar_crash(
         while not structured.is_grammar_ready:
             pass
 
+    # Prefill request1, one decode, then prefill request2.
+    # After this, both are decoding: request1 in slot 0, request2 in slot 1.
     pc_model_runner.execute_new_request(request=request1.request)
     pc_model_runner.execute_running_requests()
     pc_model_runner.execute_new_request(request=request2.request)
 
-    for i in range(4):
-        pc_model_runner.execute_running_requests()
+    # Drive all remaining decode steps.  request1 finishes after 2 more steps
+    # (max_tokens=3, already has 1), leaving a hole in slot 0.
+    # request2 must still receive its remaining tokens correctly.
+    req2_id = request2.request.request_id
+    req2_tokens_received: list[list[int]] = []
+
+    for _ in range(4):
+        out = pc_model_runner.execute_running_requests()
+        for rid, tokens in zip(out.req_ids, out.sampled_token_ids):
+            if rid == req2_id:
+                req2_tokens_received.extend(tokens)
+
+    assert len(req2_tokens_received) == request2.request.sampling_params.max_tokens, (
+        f"request2 received {len(req2_tokens_received)} tokens, "
+        f"expected {request2.request.sampling_params.max_tokens}. "
+        "Sparse index bug likely caused tokens to be attributed to the wrong request."
+    )
