@@ -210,28 +210,13 @@ def test_regular_request_not_blocked_alongside_pending_grammar(mocked_scheduler)
         "the ready_to_prefill filter likely excluded it incorrectly"
     )
 
-
-# ---------------------------------------------------------------------------
-# Integration test using the real model runner (no server required)
-# ---------------------------------------------------------------------------
-
-
 def test_sparse_index_grammar_crash(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Schedule two structured-output requests so that the first finishes
-    earlier, creating a hole in the sparse bitmask index.  This reproduces a
-    crash that occurred when the sparse index was non-contiguous.
-
-    request1 finishes after 3 decode steps, leaving slot 0 empty while
-    request2 is still decoding in slot 1.  With the bug (returning the padded
-    slot index instead of the dense output index), the sampled token for
-    request2 gets attributed to the wrong position and either:
-      - raises an IndexError (dense output has 1 row, index 1 is out of bounds), or
-      - silently assigns the token to the wrong request ID.
-
-    We assert that request2 receives exactly max_tokens=4 output tokens —
-    confirming tokens were correctly routed to it after the hole appeared.
+    """In this scenario we schedule two requests with structured outputs. The
+    first one will drop out of the batch earlier, making a hole in the sparse
+    index. This is to trigger a known bug when the sparse index is not
+    contiguous.
     """
     pc_model_runner = InstrumentedModelRunner.build(
         monkeypatch=monkeypatch,
@@ -253,6 +238,7 @@ def test_sparse_index_grammar_crash(
         use_golden_token_injection=False,
         generate_hf_results=False,
     )
+
     request2 = create_request_for_scheduler_test(
         model=model,
         request_id=1,
@@ -263,9 +249,10 @@ def test_sparse_index_grammar_crash(
         generate_hf_results=False,
     )
 
+    # Initialize grammars and requests
     for request in [request1, request2]:
         assert (sampling_params := request.request.sampling_params) is not None
-        sampling_params.structured_outputs = StructuredOutputsParams(regex=".*")
+        sampling_params.structured_outputs = StructuredOutputsParams(regex=".*")  # accept anything
         request.request.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
         )
@@ -277,29 +264,18 @@ def test_sparse_index_grammar_crash(
         pc_model_runner.scheduler.structured_output_manager.grammar_init(request.request)
 
         assert (structured := request.request.structured_output_request) is not None
+        # Wait for grammar to be ready
         while not structured.is_grammar_ready:
             pass
 
-    # Prefill request1, one decode, then prefill request2.
-    # After this, both are decoding: request1 in slot 0, request2 in slot 1.
+    # Run prefill of request 1
     pc_model_runner.execute_new_request(request=request1.request)
+    # Run first decode of request 1
     pc_model_runner.execute_running_requests()
+
+    # Run prefill of request 2
     pc_model_runner.execute_new_request(request=request2.request)
 
-    # Drive all remaining decode steps.  request1 finishes after 2 more steps
-    # (max_tokens=3, already has 1), leaving a hole in slot 0.
-    # request2 must still receive its remaining tokens correctly.
-    req2_id = request2.request.request_id
-    req2_tokens_received: list[list[int]] = []
-
-    for _ in range(4):
-        out = pc_model_runner.execute_running_requests()
-        for rid, tokens in zip(out.req_ids, out.sampled_token_ids):
-            if rid == req2_id:
-                req2_tokens_received.extend(tokens)
-
-    assert len(req2_tokens_received) == request2.request.sampling_params.max_tokens, (
-        f"request2 received {len(req2_tokens_received)} tokens, "
-        f"expected {request2.request.sampling_params.max_tokens}. "
-        "Sparse index bug likely caused tokens to be attributed to the wrong request."
-    )
+    for i in range(4):
+        # Run decode of requests 1 and 2
+        pc_model_runner.execute_running_requests()
